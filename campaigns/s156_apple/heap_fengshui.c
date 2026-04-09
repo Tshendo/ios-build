@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <mach/mach.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 
 /* Spray parameters */

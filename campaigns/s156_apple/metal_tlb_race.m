@@ -15,7 +15,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <IOSurface/IOSurface.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
