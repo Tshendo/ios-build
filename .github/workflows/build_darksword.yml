@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile
         run: |
-          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -framework CoreFoundation -O2 darksword_v5.c -o DarkSword
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -framework CoreFoundation -framework Foundation -O2 darksword_v5.c -o DarkSword
           file DarkSword
       - name: Package IPA
         run: |
