@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile
         run: |
-          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -framework CoreFoundation -O2 darksword_v4.c -o DarkSword
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -framework CoreFoundation -O2 darksword_v5.c -o DarkSword
           file DarkSword
       - name: Package IPA
         run: |
@@ -15,8 +15,8 @@ jobs:
           cp DarkSword Payload/DarkSword.app/
           printf '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>DarkSword</string><key>CFBundleIdentifier</key><string>com.nexus.darksword</string><key>CFBundleName</key><string>DarkSword</string><key>CFBundleDisplayName</key><string>DarkSword</string><key>CFBundleVersion</key><string>3</string><key>CFBundleShortVersionString</key><string>3.0</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleInfoDictionaryVersion</key><string>6.0</string><key>MinimumOSVersion</key><string>17.0</string><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array><key>UIDeviceFamily</key><array><integer>1</integer></array><key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array><key>LSRequiresIPhoneOS</key><true/></dict></plist>' > Payload/DarkSword.app/Info.plist
           echo 'APPL????' > Payload/DarkSword.app/PkgInfo
-          zip -r DarkSword_v4.ipa Payload/
+          zip -r DarkSword_v5.ipa Payload/
       - uses: actions/upload-artifact@v4
         with:
-          name: darksword-v4
-          path: DarkSword_v4.ipa
+          name: darksword-v5
+          path: DarkSword_v5.ipa
