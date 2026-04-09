@@ -25,12 +25,19 @@ static long sys5(long n, long a, long b, long c, long d, long e) {
     return x0;
 }
 
+static long sys2(long n, long a, long b) {
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x16 __asm__("x16") = n;
+    __asm__ volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x16) : "memory");
+    return x0;
+}
 static void write_file(const char *path, const char *data, int len) {
     long fd = sys3(5/*open*/, (long)path, 0x0601/*O_WRONLY|O_CREAT|O_TRUNC*/, 0644);
-    if (fd >= 0) { sys3(4/*write*/, fd, (long)data, len); sys3(6/*close*/, fd, 0); }
+    if (fd >= 0) { sys3(4/*write*/, fd, (long)data, len); sys2(6/*close*/, fd, 0); }
 }
 static int file_exists(const char *path) {
-    char buf[256]; return sys3(338/*stat*/, (long)path, (long)buf, 0) == 0;
+    char buf[256]; return sys2(338/*stat*/, (long)path, (long)buf) == 0;
 }
 static int itoa(int v, char *b) {
     if(v==0){b[0]='0';return 1;} int neg=0;if(v<0){neg=1;v=-v;}
