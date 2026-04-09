@@ -1,0 +1,14 @@
+name: b
+on: [push]
+jobs:
+  b:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -o Spray spray.c -isysroot $(xcrun -sdk iphoneos --show-sdk-path) -framework CoreFoundation
+          file Spray
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin
+          path: Spray
