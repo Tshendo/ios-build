@@ -5,40 +5,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile for iOS ARM64
+      - name: Compile
         run: |
-          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 \
-            -framework CoreFoundation -O2 \
-            darksword_detect.c -o darksword_detect
-          file darksword_detect
-          ls -la darksword_detect
-      - name: Package as IPA
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -framework CoreFoundation -O2 darksword_v3.c -o DarkSword
+          file DarkSword
+      - name: Package IPA
         run: |
           mkdir -p Payload/DarkSword.app
-          cp darksword_detect Payload/DarkSword.app/DarkSword
-          cat > Payload/DarkSword.app/Info.plist << 'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>CFBundleExecutable</key><string>DarkSword</string>
-            <key>CFBundleIdentifier</key><string>com.nexus.darksword</string>
-            <key>CFBundleName</key><string>DarkSword</string>
-            <key>CFBundleDisplayName</key><string>DarkSword</string>
-            <key>CFBundleVersion</key><string>2</string>
-            <key>CFBundleShortVersionString</key><string>2.0</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-            <key>MinimumOSVersion</key><string>17.0</string>
-            <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
-            <key>UIDeviceFamily</key><array><integer>1</integer></array>
-            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
-            <key>LSRequiresIPhoneOS</key><true/>
-          </dict></plist>
-          PLIST
-          echo "APPL????" > Payload/DarkSword.app/PkgInfo
-          zip -r DarkSword_v2.ipa Payload/
-          ls -la DarkSword_v2.ipa
+          cp DarkSword Payload/DarkSword.app/
+          printf '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>DarkSword</string><key>CFBundleIdentifier</key><string>com.nexus.darksword</string><key>CFBundleName</key><string>DarkSword</string><key>CFBundleDisplayName</key><string>DarkSword</string><key>CFBundleVersion</key><string>3</string><key>CFBundleShortVersionString</key><string>3.0</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleInfoDictionaryVersion</key><string>6.0</string><key>MinimumOSVersion</key><string>17.0</string><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array><key>UIDeviceFamily</key><array><integer>1</integer></array><key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array><key>LSRequiresIPhoneOS</key><true/></dict></plist>' > Payload/DarkSword.app/Info.plist
+          echo 'APPL????' > Payload/DarkSword.app/PkgInfo
+          zip -r DarkSword_v3.ipa Payload/
       - uses: actions/upload-artifact@v4
         with:
-          name: darksword-v2
-          path: DarkSword_v2.ipa
+          name: darksword-v3
+          path: DarkSword_v3.ipa
