@@ -17,6 +17,21 @@ jobs:
           name: heap-fengshui
           path: HeapFengShui
 
+  cve28858:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o CVE28858 campaigns/s156_apple/cve_28858_poc.c \
+            -isysroot $(xcrun -sdk iphoneos --show-sdk-path) \
+            -framework CoreFoundation
+          file CVE28858
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cve28858-poc
+          path: CVE28858
+
   metal_race:
     runs-on: macos-latest
     steps:
