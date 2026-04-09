@@ -1,22 +1,26 @@
-name: Build DarkSword
+name: Build JPEG UAF
 on: [push]
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile
+      - name: Build
         run: |
-          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -framework CoreFoundation -framework Foundation -O2 darksword_v5.c -o DarkSword
-          file DarkSword
-      - name: Package IPA
-        run: |
-          mkdir -p Payload/DarkSword.app
-          cp DarkSword Payload/DarkSword.app/
-          printf '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>DarkSword</string><key>CFBundleIdentifier</key><string>com.nexus.darksword</string><key>CFBundleName</key><string>DarkSword</string><key>CFBundleDisplayName</key><string>DarkSword</string><key>CFBundleVersion</key><string>3</string><key>CFBundleShortVersionString</key><string>3.0</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleInfoDictionaryVersion</key><string>6.0</string><key>MinimumOSVersion</key><string>17.0</string><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array><key>UIDeviceFamily</key><array><integer>1</integer></array><key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array><key>LSRequiresIPhoneOS</key><true/></dict></plist>' > Payload/DarkSword.app/Info.plist
-          echo 'APPL????' > Payload/DarkSword.app/PkgInfo
-          zip -r DarkSword_v5.ipa Payload/
+          cd ios-app
+          xcodebuild -project Test.xcodeproj -scheme Test \
+            -destination 'generic/platform=iOS' -configuration Release \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO ARCHS=arm64 VALID_ARCHS=arm64 \
+            IPHONEOS_DEPLOYMENT_TARGET=17.0 build 2>&1 | tail -20
+          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "Test.app" -type d | head -1)
+          echo "APP: $APP"
+          if [ -n "$APP" ]; then
+            mkdir -p /tmp/Payload && cp -r "$APP" /tmp/Payload/
+            cd /tmp && zip -r $GITHUB_WORKSPACE/JpegUAF.ipa Payload/
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: darksword-v5
-          path: DarkSword_v5.ipa
+          name: jpeg-uaf
+          path: JpegUAF.ipa
+          if-no-files-found: warn
