@@ -182,6 +182,8 @@ _Static_assert(sizeof(AppleJPEGDriverIOStruct) == 0x58,
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
+    // Prevent auto-lock while app is running
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
     // Auto-trigger after 3 seconds
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         [self autoTrigger];
