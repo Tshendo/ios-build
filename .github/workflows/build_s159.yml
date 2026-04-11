@@ -52,20 +52,18 @@ jobs:
           </dict></plist>
           EOF
 
-          # Install ldid
-          brew install ldid 2>/dev/null || true
-
-          # Sign with ldid (fake signature, device has AMFI bypass via MDM profile)
-          if command -v ldid >/dev/null; then
-            ldid -S DarkSword_v7.app/DarkSword_v7
-            echo "ldid signed"
-          fi
+          # Sign with adhoc codesign (accepted by iOS Developer Mode + MDM supervised)
+          codesign -f -s - DarkSword_v7.app/DarkSword_v7
+          echo "codesign adhoc: $?"
+          codesign -dv DarkSword_v7.app/DarkSword_v7 2>&1 | head -5
 
           # Package as IPA
           mkdir -p Payload
           cp -r DarkSword_v7.app Payload/
           zip -r DarkSword_v7.ipa Payload/
           ls -la DarkSword_v7.ipa
+          # Verify signature in IPA
+          unzip -p DarkSword_v7.ipa Payload/DarkSword_v7.app/_CodeSignature/CodeResources | head -c 100 && echo "(signature present)"
       - uses: actions/upload-artifact@v4
         with:
           name: darksword-v7-ipa
