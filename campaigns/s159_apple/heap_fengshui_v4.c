@@ -136,11 +136,20 @@ static void scan_ports(void) {
         mach_vm_address_t kobject = 0;
         kern_return_t kr = mach_port_kobject(mach_task_self(), g_ports[i],
                                               &kotype, &kobject);
-        if (kr != KERN_SUCCESS
-            || kotype  != g_base_kotype[i]
-            || kobject != g_base_kobject[i]) {
+        /*
+         * Targeted detection — avoids false triggers on fresh ports:
+         *   Trigger A: kobject is a kernel pointer (shader wrote kernel_base into ip_kobject)
+         *   Trigger B: kotype changed to IKOT_TASK=2 (shader wrote 0x80000002 into io_bits)
+         *
+         * Fresh ports: kr=KERN_SUCCESS, kotype=0, kobject=0 (normal, no kobject set).
+         * We do NOT trigger on mere kr!=SUCCESS to avoid false positives on sandboxed access.
+         */
+        int kern_ptr    = (kr == KERN_SUCCESS && kobject > 0xfffffe0000000000ULL);
+        int ikot_changed = (kr == KERN_SUCCESS && kotype == IKOT_TASK
+                            && kotype != g_base_kotype[i]);
+        if (kern_ptr || ikot_changed) {
             report_corruption(i, kr, kotype, kobject);
-            return; /* one report per scan cycle */
+            return;
         }
     }
 }
