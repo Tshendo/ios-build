@@ -1,0 +1,107 @@
+name: s159 darksword_v7 + agx_controlled_write
+on: [push]
+
+jobs:
+  darksword_v7:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build DarkSword v7 (per-socket markers, controlled write detection)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o DarkSword_v7 campaigns/s159_apple/darksword_v7.c \
+            -isysroot "$SDK" \
+            -framework CoreFoundation -framework Foundation
+          file DarkSword_v7
+          ls -la DarkSword_v7
+          echo "Build hash: $(shasum -a 256 DarkSword_v7 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darksword-v7
+          path: DarkSword_v7
+
+  package_darksword_v7:
+    runs-on: macos-latest
+    needs: darksword_v7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: darksword-v7
+      - name: Package DarkSword v7 as .app and sign with ldid
+        run: |
+          # Build .app bundle
+          mkdir -p DarkSword_v7.app
+          cp DarkSword_v7 DarkSword_v7.app/DarkSword_v7
+
+          # Create Info.plist
+          cat > DarkSword_v7.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>DarkSword_v7</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.darksword.v7.TMAQ26273N</string>
+            <key>CFBundleVersion</key><string>7.0</string>
+            <key>CFBundleShortVersionString</key><string>7.0</string>
+            <key>CFBundleName</key><string>DarkSword_v7</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          # Install ldid
+          brew install ldid 2>/dev/null || true
+
+          # Sign with ldid (fake signature, device has AMFI bypass via MDM profile)
+          if command -v ldid >/dev/null; then
+            ldid -S DarkSword_v7.app/DarkSword_v7
+            echo "ldid signed"
+          fi
+
+          # Package as IPA
+          mkdir -p Payload
+          cp -r DarkSword_v7.app Payload/
+          zip -r DarkSword_v7.ipa Payload/
+          ls -la DarkSword_v7.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darksword-v7-ipa
+          path: DarkSword_v7.ipa
+
+  heap_fengshui_v2_icmp:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build HeapFengShui v2 ICMPv6 variant (168B in6pcb zone spray)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          # Use existing heap_fengshui.c as base — it already sprays ICMPv6 sockets
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o HeapFengShui_icmp campaigns/s156_apple/heap_fengshui.c \
+            -isysroot "$SDK" \
+            -framework CoreFoundation
+          file HeapFengShui_icmp
+          ls -la HeapFengShui_icmp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-icmp
+          path: HeapFengShui_icmp
+
+  check_existing:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify existing s158 artifacts
+        run: |
+          echo "=== s158 artifacts ==="
+          ls -la campaigns/s158_apple/*.c campaigns/s158_apple/*.m 2>/dev/null || echo "no C/M files"
+          echo "=== s159 artifacts ==="
+          ls -la campaigns/s159_apple/*.c campaigns/s159_apple/*.js 2>/dev/null || echo "no new files"
+          echo "=== Kernel info ==="
+          echo "Target: iPhone18,2 iOS 26.3.1 beta (23D8133) A19 Pro T8150"
+          echo "Kernel base (from panic): 0xfffffe004d928000 slide=0x46924000"
+          echo "AGX zone target: kalloc.icmp6pcb = 168B in6pcb"
+          echo "Vertex shader varyings encode kernel_base in in6p_icmp6filt field"
