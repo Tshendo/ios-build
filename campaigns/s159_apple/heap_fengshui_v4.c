@@ -120,8 +120,7 @@ static void report_corruption(int idx, kern_return_t kr,
     /* Also stderr for syslog */
     write(STDERR_FILENO, buf, n);
 
-    g_found   = 1;
-    g_reports = 1;
+    g_found = 1;
 }
 
 static void scan_ports(void) {
