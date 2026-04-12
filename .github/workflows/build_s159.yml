@@ -154,6 +154,70 @@ jobs:
           name: heap-fengshui-v4-ipa
           path: HeapFengShui_v4_unsigned.ipa
 
+  heap_fengshui_v5:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build HeapFengShui v5 (pthread probe, LIMITS_INFO detection, CFRunLoop-free)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o HeapFengShui_v5 campaigns/s159_apple/heap_fengshui_v5.c \
+            -isysroot "$SDK"
+          file HeapFengShui_v5
+          ls -la HeapFengShui_v5
+          echo "Build hash: $(shasum -a 256 HeapFengShui_v5 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-v5
+          path: HeapFengShui_v5
+
+  package_fengshui_v5:
+    runs-on: macos-latest
+    needs: heap_fengshui_v5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: heap-fengshui-v5
+      - name: Package HeapFengShui v5 as IPA (same bundle ID as v4 for Sideloadly replace)
+        run: |
+          mkdir -p HeapFengShui_v4.app
+          cp HeapFengShui_v5 HeapFengShui_v4.app/HeapFengShui_v5
+          chmod +x HeapFengShui_v4.app/HeapFengShui_v5
+
+          cat > HeapFengShui_v4.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>HeapFengShui_v5</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.fengshui4.TMAQ26273N</string>
+            <key>CFBundleVersion</key><string>5.0</string>
+            <key>CFBundleShortVersionString</key><string>5.0</string>
+            <key>CFBundleName</key><string>HeapFengShui_v4</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - HeapFengShui_v4.app/HeapFengShui_v5
+          echo "adhoc codesign: $?"
+
+          mkdir -p Payload
+          cp -r HeapFengShui_v4.app Payload/
+          zip -r HeapFengShui_v5_sideloadly.ipa Payload/
+          ls -la HeapFengShui_v5_sideloadly.ipa
+          echo "IPA ready — Sideloadly re-signs with team TMAQ26273N"
+          echo "After install: bundle=com.nexus.fengshui4.TMAQ26273N.TMAQ26273N"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-v5-ipa
+          path: HeapFengShui_v5_sideloadly.ipa
+
   check_existing:
     runs-on: macos-latest
     steps:
