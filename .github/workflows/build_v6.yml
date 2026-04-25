@@ -6,15 +6,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile AllocatorProbe v9 (arm64 iOS, ICMPv6+MachPort dual canary)
+      - name: Compile AllocatorProbe v9
         run: |
           SDK=$(xcrun -sdk iphoneos --show-sdk-path)
           xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
             -o AllocatorProbe_v9 campaigns/s159_apple/heap_fengshui_v9.c \
-            -isysroot "$SDK" \
-            -framework CoreFoundation
-          file AllocatorProbe_v9
-          shasum -a 256 AllocatorProbe_v9
+            -isysroot "$SDK" -framework CoreFoundation
+          file AllocatorProbe_v9 && shasum -a 256 AllocatorProbe_v9
       - uses: actions/upload-artifact@v4
         with:
           name: AllocatorProbe_v9
@@ -33,7 +31,7 @@ jobs:
         with:
           p12-file-base64: ${{ secrets.CERT_P12_BASE64 }}
           p12-password: ${{ secrets.CERT_P12_PASSWORD }}
-      - name: Prepare and sign IPA
+      - name: Package and sign
         env:
           MOBILEPROVISION_B64: ${{ secrets.MOBILEPROVISION_BASE64 }}
         run: |
@@ -42,39 +40,35 @@ jobs:
           cp AllocatorProbe_v9 AllocatorProbe_v9.app/AllocatorProbe_v9
           chmod +x AllocatorProbe_v9.app/AllocatorProbe_v9
           cp embedded.mobileprovision AllocatorProbe_v9.app/embedded.mobileprovision
-          cat > AllocatorProbe_v9.app/Info.plist << 'INFOPLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>CFBundleExecutable</key><string>AllocatorProbe_v9</string>
-  <key>CFBundleIdentifier</key><string>com.nexus.fengshui3.TMAQ26273N.TMAQ26273N</string>
-  <key>CFBundleVersion</key><string>9.0</string>
-  <key>CFBundleShortVersionString</key><string>9.0</string>
-  <key>CFBundleName</key><string>AllocatorProbe_v9</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
-  <key>MinimumOSVersion</key><string>17.0</string>
-  <key>LSRequiresIPhoneOS</key><true/>
-</dict></plist>
-INFOPLIST
-          cat > entitlements.plist << 'ENTPLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>application-identifier</key><string>TMAQ26273N.com.nexus.fengshui3.TMAQ26273N.TMAQ26273N</string>
-  <key>keychain-access-groups</key><array><string>TMAQ26273N.*</string></array>
-  <key>get-task-allow</key><true/><key>com.apple.developer.team-identifier</key><string>TMAQ26273N</string>
-</dict></plist>
-ENTPLIST
+          python3 -c "
+open('AllocatorProbe_v9.app/Info.plist','w').write('''<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\"><dict>
+<key>CFBundleExecutable</key><string>AllocatorProbe_v9</string>
+<key>CFBundleIdentifier</key><string>com.nexus.fengshui3.TMAQ26273N.TMAQ26273N</string>
+<key>CFBundleVersion</key><string>9.0</string>
+<key>CFBundleShortVersionString</key><string>9.0</string>
+<key>CFBundleName</key><string>AllocatorProbe_v9</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+<key>MinimumOSVersion</key><string>17.0</string>
+<key>LSRequiresIPhoneOS</key><true/>
+</dict></plist>''')
+open('entitlements.plist','w').write('''<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\"><dict>
+<key>application-identifier</key><string>TMAQ26273N.com.nexus.fengshui3.TMAQ26273N.TMAQ26273N</string>
+<key>keychain-access-groups</key><array><string>TMAQ26273N.*</string></array>
+<key>get-task-allow</key><true/>
+<key>com.apple.developer.team-identifier</key><string>TMAQ26273N</string>
+</dict></plist>''')
+"
           IDENTITY=$(security find-identity -v -p codesigning | grep "iPhone Developer" | head -1 | awk '{print $2}')
-          echo "Signing with: $IDENTITY"
+          echo "Identity: $IDENTITY"
           codesign -f -s "$IDENTITY" --entitlements entitlements.plist AllocatorProbe_v9.app/AllocatorProbe_v9
-          codesign -dv AllocatorProbe_v9.app/AllocatorProbe_v9 2>&1 | head -5
-          mkdir -p Payload
-          cp -r AllocatorProbe_v9.app Payload/
+          mkdir -p Payload && cp -r AllocatorProbe_v9.app Payload/
           zip -r AllocatorProbe_v9_signed.ipa Payload/
           ls -la AllocatorProbe_v9_signed.ipa
-          echo "=== v9 IPA ready: ICMPv6 canaries + mach ports, UDP=192.168.68.109 ==="
       - uses: actions/upload-artifact@v4
         with:
           name: AllocatorProbe_v9_signed
