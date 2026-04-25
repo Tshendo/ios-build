@@ -1,4 +1,4 @@
-name: AllocatorProbe v6 signed
+name: AllocatorProbe v7 signed
 on: [push]
 
 jobs:
@@ -6,18 +6,18 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile AllocatorProbe v6
+      - name: Compile AllocatorProbe v7
         run: |
           SDK=$(xcrun -sdk iphoneos --show-sdk-path)
           xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
-            -o AllocatorProbe_v6 campaigns/s159_apple/heap_fengshui_v6.c \
+            -o AllocatorProbe_v7 campaigns/s159_apple/heap_fengshui_v7.c \
             -isysroot "$SDK" -framework CoreFoundation
-          file AllocatorProbe_v6
-          shasum -a 256 AllocatorProbe_v6
+          file AllocatorProbe_v7
+          shasum -a 256 AllocatorProbe_v7
       - uses: actions/upload-artifact@v4
         with:
-          name: AllocatorProbe_v6_bin
-          path: AllocatorProbe_v6
+          name: AllocatorProbe_v7_bin
+          path: AllocatorProbe_v7
 
   sign-and-package:
     runs-on: macos-latest
@@ -27,7 +27,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: AllocatorProbe_v6_bin
+          name: AllocatorProbe_v7_bin
 
       - name: Import certificate
         uses: apple-actions/import-codesign-certs@v3
@@ -39,25 +39,27 @@ jobs:
         env:
           MOBILEPROVISION_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
         run: |
-          mkdir -p AllocatorProbe_v6.app
-          cp AllocatorProbe_v6 AllocatorProbe_v6.app/AllocatorProbe_v6
-          chmod +x AllocatorProbe_v6.app/AllocatorProbe_v6
-          cp signing/Info.plist AllocatorProbe_v6.app/Info.plist
-          echo "$MOBILEPROVISION_BASE64" | base64 -d > AllocatorProbe_v6.app/embedded.mobileprovision
+          mkdir -p AllocatorProbe_v7.app
+          cp AllocatorProbe_v7 AllocatorProbe_v7.app/AllocatorProbe_v7
+          chmod +x AllocatorProbe_v7.app/AllocatorProbe_v7
+
+          sed 's/AllocatorProbe_v6/AllocatorProbe_v7/g; s/<string>6.0<\/string>/<string>7.0<\/string>/g' \
+            signing/Info.plist > AllocatorProbe_v7.app/Info.plist
+
+          echo "$MOBILEPROVISION_BASE64" | base64 -d > AllocatorProbe_v7.app/embedded.mobileprovision
 
           codesign -f -s "iPhone Developer: bestai.04.a@gmail.com (4B5SHD444M)" \
             --entitlements signing/entitlements.plist \
-            AllocatorProbe_v6.app
+            AllocatorProbe_v7.app
 
-          codesign --verify AllocatorProbe_v6.app && echo "Signature valid"
-          codesign -dvvv AllocatorProbe_v6.app 2>&1 | head -15
+          codesign --verify AllocatorProbe_v7.app && echo "Signature valid"
 
           mkdir -p Payload
-          cp -r AllocatorProbe_v6.app Payload/
-          zip -r AllocatorProbe_v6_signed.ipa Payload/
-          ls -la AllocatorProbe_v6_signed.ipa
+          cp -r AllocatorProbe_v7.app Payload/
+          zip -r AllocatorProbe_v7_signed.ipa Payload/
+          ls -la AllocatorProbe_v7_signed.ipa
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AllocatorProbe_v6_signed
-          path: AllocatorProbe_v6_signed.ipa
+          name: AllocatorProbe_v7_signed
+          path: AllocatorProbe_v7_signed.ipa
