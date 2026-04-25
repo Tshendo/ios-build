@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleExecutable</key><string>AllocatorProbe_v9</string>
+  <key>CFBundleExecutable</key><string>AllocatorProbe_v10</string>
   <key>CFBundleIdentifier</key><string>com.nexus.fengshui3.TMAQ26273N.TMAQ26273N</string>
-  <key>CFBundleVersion</key><string>9.0</string>
-  <key>CFBundleShortVersionString</key><string>9.0</string>
-  <key>CFBundleName</key><string>AllocatorProbe_v9</string>
+  <key>CFBundleVersion</key><string>10.0</string>
+  <key>CFBundleShortVersionString</key><string>10.0</string>
+  <key>CFBundleName</key><string>AllocatorProbe_v10</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
   <key>MinimumOSVersion</key><string>17.0</string>
