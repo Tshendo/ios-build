@@ -218,6 +218,63 @@ jobs:
           name: heap-fengshui-v5-ipa
           path: HeapFengShui_v5_sideloadly.ipa
 
+
+  allocator_probe_v6:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v6 (Commpage Target Flag crash trigger)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o AllocatorProbe_v6 campaigns/s159_apple/heap_fengshui_v6.c \
+            -isysroot "$SDK" \
+            -framework CoreFoundation
+          file AllocatorProbe_v6
+          ls -la AllocatorProbe_v6
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v6
+          path: AllocatorProbe_v6
+
+  package_fengshui_v6:
+    runs-on: macos-latest
+    needs: allocator_probe_v6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: allocator-probe-v6
+      - name: Package AllocatorProbe v6 IPA (bundle=com.nexus.fengshui3 replaces v3 on device)
+        run: |
+          mkdir -p AllocatorProbe_v6.app
+          cp AllocatorProbe_v6 AllocatorProbe_v6.app/AllocatorProbe_v6
+          chmod +x AllocatorProbe_v6.app/AllocatorProbe_v6
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"' \
+            '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict>' \
+            '  <key>CFBundleExecutable</key><string>AllocatorProbe_v6</string>' \
+            '  <key>CFBundleIdentifier</key><string>com.nexus.fengshui3</string>' \
+            '  <key>CFBundleVersion</key><string>6.0</string>' \
+            '  <key>CFBundleShortVersionString</key><string>6.0</string>' \
+            '  <key>CFBundleName</key><string>AllocatorProbe_v6</string>' \
+            '  <key>CFBundlePackageType</key><string>APPL</string>' \
+            '  <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>' \
+            '  <key>MinimumOSVersion</key><string>17.0</string>' \
+            '  <key>LSRequiresIPhoneOS</key><true/>' \
+            '  <key>LSApplicationCategoryType</key><string></string>' \
+            '</dict></plist>' > AllocatorProbe_v6.app/Info.plist
+          codesign -f -s - AllocatorProbe_v6.app/AllocatorProbe_v6
+          mkdir -p Payload && cp -r AllocatorProbe_v6.app Payload/
+          zip -r AllocatorProbe_v6_sideloadly.ipa Payload/
+          ls -la AllocatorProbe_v6_sideloadly.ipa
+          echo "IPA ready: Sideloadly re-signs -> com.nexus.fengshui3.TMAQ26273N.TMAQ26273N"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v6-ipa
+          path: AllocatorProbe_v6_sideloadly.ipa
+
   check_existing:
     runs-on: macos-latest
     steps:
