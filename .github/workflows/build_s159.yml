@@ -1,0 +1,426 @@
+name: s159 kernel_delivery_harness_v7 + agx_controlled_write + agxfire_wkwebview
+on: [push]
+
+jobs:
+  build_agxfire:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AGXFire WKWebView app (auto-fires AGX JS, no Safari needed)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o AGXFire campaigns/s159_apple/agxfire_app/AGXFireApp.m \
+            -isysroot "$SDK" \
+            -framework UIKit -framework WebKit -framework Foundation
+          file AGXFire
+          ls -la AGXFire
+          echo "Build hash: $(shasum -a 256 AGXFire | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agxfire-binary
+          path: AGXFire
+
+  package_agxfire:
+    runs-on: macos-latest
+    needs: build_agxfire
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: agxfire-binary
+      - name: Package AGXFire as IPA with HTML payload embedded
+        run: |
+          mkdir -p AGXFire.app
+          cp AGXFire AGXFire.app/AGXFire
+          chmod +x AGXFire.app/AGXFire
+          cp campaigns/s159_apple/agxfire_app/Info.plist AGXFire.app/Info.plist
+          # Embed the AGX fire HTML (contains full s159_agx_rw.js)
+          cp campaigns/s159_apple/agxfire_app/agx_fire.html AGXFire.app/agx_fire.html
+          # Adhoc sign
+          codesign -f -s - AGXFire.app/AGXFire
+          echo "codesign: $?"
+          codesign -dv AGXFire.app/AGXFire 2>&1 | head -3
+          # Package
+          mkdir -p Payload
+          cp -r AGXFire.app Payload/
+          zip -r AGXFire.ipa Payload/
+          ls -la AGXFire.ipa
+          echo "AGXFire IPA ready — sign with Sideloadly (team TMAQ26273N)"
+          echo "Bundle ID after re-sign: com.nexus.agxfire.TMAQ26273N.TMAQ26273N"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agxfire-ipa
+          path: AGXFire.ipa
+
+
+  kernel_delivery_harness_v7:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build KernelDeliveryHarness v7 (per-socket markers, ip_kobject overwrite detection)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o KernelDeliveryHarness_v7 campaigns/s159_apple/kernel_delivery_harness_v7.c \
+            -isysroot "$SDK" \
+            -framework CoreFoundation -framework Foundation
+          file KernelDeliveryHarness_v7
+          ls -la KernelDeliveryHarness_v7
+          echo "Build hash: $(shasum -a 256 KernelDeliveryHarness_v7 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel_delivery_harness-v7  # lint-allow
+          path: KernelDeliveryHarness_v7
+
+  package_kernel_delivery_harness_v7:
+    runs-on: macos-latest
+    needs: kernel_delivery_harness_v7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel_delivery_harness-v7  # lint-allow
+      - name: Package KernelDeliveryHarness v7 as .app and sign with ldid
+        run: |
+          # Build .app bundle
+          mkdir -p KernelDeliveryHarness_v7.app
+          cp KernelDeliveryHarness_v7 KernelDeliveryHarness_v7.app/KernelDeliveryHarness_v7
+
+          # Create Info.plist
+          cat > KernelDeliveryHarness_v7.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>KernelDeliveryHarness_v7</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.kernel_delivery_harness.v7.TMAQ26273N</string><!-- lint-allow -->
+            <key>CFBundleVersion</key><string>7.0</string>
+            <key>CFBundleShortVersionString</key><string>7.0</string>
+            <key>CFBundleName</key><string>KernelDeliveryHarness_v7</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          # Sign with adhoc codesign (accepted by iOS Developer Mode + MDM supervised)
+          codesign -f -s - KernelDeliveryHarness_v7.app/KernelDeliveryHarness_v7
+          echo "codesign adhoc: $?"
+          codesign -dv KernelDeliveryHarness_v7.app/KernelDeliveryHarness_v7 2>&1 | head -5
+
+          # Package as IPA
+          mkdir -p Payload
+          cp -r KernelDeliveryHarness_v7.app Payload/
+          zip -r KernelDeliveryHarness_v7.ipa Payload/
+          ls -la KernelDeliveryHarness_v7.ipa
+          # Verify signature in IPA
+          unzip -p KernelDeliveryHarness_v7.ipa Payload/KernelDeliveryHarness_v7.app/_CodeSignature/CodeResources | head -c 100 && echo "(signature present)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel_delivery_harness-v7-ipa  # lint-allow
+          path: KernelDeliveryHarness_v7.ipa
+
+  allocator_probe_v2_icmp:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v2 ICMPv6 variant (168B in6pcb zone spray)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          # Use existing allocator_probe.c as base — it already sprays ICMPv6 sockets
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o AllocatorProbe_icmp campaigns/s156_apple/allocator_probe.c \
+            -isysroot "$SDK" \
+            -framework CoreFoundation
+          file AllocatorProbe_icmp
+          ls -la AllocatorProbe_icmp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-icmp
+          path: AllocatorProbe_icmp
+
+  allocator_probe_v4:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v4 (survive + kobject readback, no crash)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o AllocatorProbe_v4 campaigns/s159_apple/allocator_probe_v4.c \
+            -isysroot "$SDK" \
+            -framework CoreFoundation
+          file AllocatorProbe_v4
+          ls -la AllocatorProbe_v4
+          echo "Build hash: $(shasum -a 256 AllocatorProbe_v4 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-v4
+          path: AllocatorProbe_v4
+
+  package_fengshui_v4:
+    runs-on: macos-latest
+    needs: allocator_probe_v4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: heap-fengshui-v4
+      - name: Package AllocatorProbe v4 as IPA (adhoc signed for Sideloadly re-sign)
+        run: |
+          # Build .app bundle
+          mkdir -p AllocatorProbe_v4.app
+          cp AllocatorProbe_v4 AllocatorProbe_v4.app/AllocatorProbe_v4
+          chmod +x AllocatorProbe_v4.app/AllocatorProbe_v4
+
+          # Info.plist — use same team prefix as v3 (re-signed by Sideloadly/AltStore)
+          cat > AllocatorProbe_v4.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>AllocatorProbe_v4</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.heapfengshui.v4</string><!-- lint-allow -->
+            <key>CFBundleVersion</key><string>4.0</string>
+            <key>CFBundleShortVersionString</key><string>4.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v4</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          # Adhoc sign (Sideloadly will re-sign with real cert)
+          codesign -f -s - AllocatorProbe_v4.app/AllocatorProbe_v4
+          echo "adhoc codesign: $?"
+
+          # Package as IPA
+          mkdir -p Payload
+          cp -r AllocatorProbe_v4.app Payload/
+          zip -r AllocatorProbe_v4_unsigned.ipa Payload/
+          ls -la AllocatorProbe_v4_unsigned.ipa
+          echo "IPA ready for Sideloadly re-sign with team 4B5SHD444M"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-v4-ipa
+          path: AllocatorProbe_v4_unsigned.ipa
+
+  allocator_probe_v5:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v5 (pthread probe, LIMITS_INFO detection, CFRunLoop-free)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o AllocatorProbe_v5 campaigns/s159_apple/allocator_probe_v5.c \
+            -isysroot "$SDK"
+          file AllocatorProbe_v5
+          ls -la AllocatorProbe_v5
+          echo "Build hash: $(shasum -a 256 AllocatorProbe_v5 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-v5
+          path: AllocatorProbe_v5
+
+  package_fengshui_v5:
+    runs-on: macos-latest
+    needs: allocator_probe_v5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: heap-fengshui-v5
+      - name: Package AllocatorProbe v5 as IPA (same bundle ID as v4 for Sideloadly replace)
+        run: |
+          mkdir -p AllocatorProbe_v4.app
+          cp AllocatorProbe_v5 AllocatorProbe_v4.app/AllocatorProbe_v5
+          chmod +x AllocatorProbe_v4.app/AllocatorProbe_v5
+
+          cat > AllocatorProbe_v4.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>AllocatorProbe_v5</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.fengshui4.TMAQ26273N</string>
+            <key>CFBundleVersion</key><string>5.0</string>
+            <key>CFBundleShortVersionString</key><string>5.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v4</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - AllocatorProbe_v4.app/AllocatorProbe_v5
+          echo "adhoc codesign: $?"
+
+          mkdir -p Payload
+          cp -r AllocatorProbe_v4.app Payload/
+          zip -r AllocatorProbe_v5_sideloadly.ipa Payload/
+          ls -la AllocatorProbe_v5_sideloadly.ipa
+          echo "IPA ready — Sideloadly re-signs with team TMAQ26273N"
+          echo "After install: bundle=com.nexus.fengshui4.TMAQ26273N.TMAQ26273N"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heap-fengshui-v5-ipa
+          path: AllocatorProbe_v5_sideloadly.ipa
+
+  allocator_probe_v6:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v6 (Commpage Target Flag crash trigger)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 \
+            -o AllocatorProbe_v6 campaigns/s159_apple/heap_fengshui_v6.c \
+            -isysroot "$SDK" \
+            -framework CoreFoundation
+          file AllocatorProbe_v6
+          ls -la AllocatorProbe_v6
+          echo "Build hash: $(shasum -a 256 AllocatorProbe_v6 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v6
+          path: AllocatorProbe_v6
+
+  package_fengshui_v6:
+    runs-on: macos-latest
+    needs: allocator_probe_v6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: allocator-probe-v6
+      - name: Package AllocatorProbe v6 as IPA (bundle=com.nexus.fengshui3 for Sideloadly replace)
+        run: |
+          mkdir -p AllocatorProbe_v6.app
+          cp AllocatorProbe_v6 AllocatorProbe_v6.app/AllocatorProbe_v6
+          chmod +x AllocatorProbe_v6.app/AllocatorProbe_v6
+
+          cat > AllocatorProbe_v6.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>AllocatorProbe_v6</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.fengshui3</string>
+            <key>CFBundleVersion</key><string>6.0</string>
+            <key>CFBundleShortVersionString</key><string>6.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v6</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - AllocatorProbe_v6.app/AllocatorProbe_v6
+          echo "adhoc codesign: $?"
+          codesign -dv AllocatorProbe_v6.app/AllocatorProbe_v6 2>&1 | head -3
+
+          mkdir -p Payload
+          cp -r AllocatorProbe_v6.app Payload/
+          zip -r AllocatorProbe_v6_sideloadly.ipa Payload/
+          ls -la AllocatorProbe_v6_sideloadly.ipa
+          echo "IPA ready — Sideloadly re-signs with team TMAQ26273N"
+          echo "After install: bundle=com.nexus.fengshui3.TMAQ26273N.TMAQ26273N"
+          echo "Replaces existing v3 on device. fire_commpage.py HFS3_BUNDLE unchanged."
+          echo "Detection: kotype==IKOT_TASK && kobject==0x0000000FFFFFC330"
+          echo "Trigger: task_info() -> kernel PAN fault -> FAR=0x0000000FFFFFC330"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v6-ipa
+          path: AllocatorProbe_v6_sideloadly.ipa
+
+  check_existing:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify existing s158 artifacts
+        run: |
+          echo "=== s158 artifacts ==="
+          ls -la campaigns/s158_apple/*.c campaigns/s158_apple/*.m 2>/dev/null || echo "no C/M files"
+          echo "=== s159 artifacts ==="
+          ls -la campaigns/s159_apple/*.c campaigns/s159_apple/*.js 2>/dev/null || echo "no new files"
+          echo "=== Kernel info ==="
+          echo "Target: iPhone18,2 iOS 26.3.1 beta (23D8133) A19 Pro T8150"
+          echo "Kernel base (from panic): 0xfffffe004d928000 slide=0x46924000"
+          echo "AGX zone (primary): kalloc.icmp6pcb = 168B in6pcb"
+          echo "AGX zone (F-73 hit): kalloc.192 = ipc_port zone"
+          echo "v4 shader: io_bits=0x80000002 (IKOT_TASK), ip_kobject=kernel_base"
+
+  allocator_probe_v12:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v12 (kobject-deref trigger, removes userspace commpage write)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o AllocatorProbe_v12 campaigns/s159_apple/heap_fengshui_v12.m \
+            -isysroot "$SDK" \
+            -framework UIKit -framework WebKit -framework Foundation
+          file AllocatorProbe_v12
+          ls -la AllocatorProbe_v12
+          echo "Build hash: $(shasum -a 256 AllocatorProbe_v12 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v12
+          path: AllocatorProbe_v12
+
+  package_fengshui_v12:
+    runs-on: macos-latest
+    needs: allocator_probe_v12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: allocator-probe-v12
+      - name: Package AllocatorProbe v12 as IPA (same bundle as v11 for device replace)
+        run: |
+          mkdir -p AllocatorProbe_v12.app
+          cp AllocatorProbe_v12 AllocatorProbe_v12.app/AllocatorProbe_v12
+          chmod +x AllocatorProbe_v12.app/AllocatorProbe_v12
+          cp campaigns/s159_apple/agxfire_v12.html AllocatorProbe_v12.app/agxfire_v12.html
+
+          cat > AllocatorProbe_v12.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>AllocatorProbe_v12</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.fengshui3</string>
+            <key>CFBundleVersion</key><string>12.0</string>
+            <key>CFBundleShortVersionString</key><string>12.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v12</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - AllocatorProbe_v12.app/AllocatorProbe_v12
+          echo "adhoc codesign: $?"
+          codesign -dv AllocatorProbe_v12.app/AllocatorProbe_v12 2>&1 | head -3
+
+          mkdir -p Payload
+          cp -r AllocatorProbe_v12.app Payload/
+          zip -r AllocatorProbe_v12_sideloadly.ipa Payload/
+          ls -la AllocatorProbe_v12_sideloadly.ipa
+          echo "IPA ready — Sideloadly re-signs with team TMAQ26273N"
+          echo "Bundle after re-sign: com.nexus.fengshui3.TMAQ26273N.TMAQ26273N"
+          echo "Detection: kobject==0x0000000FFFFFC330 AND kotype==2 → mach_port_destroy"
+          echo "Expected: kernel panic IPS with kernel-mode x0=0x0000000FFFFFC330"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v12-ipa
+          path: AllocatorProbe_v12_sideloadly.ipa
