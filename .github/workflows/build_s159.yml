@@ -493,3 +493,138 @@ jobs:
         with:
           name: allocator-probe-v12-ipa
           path: AllocatorProbe_v12_sideloadly.ipa
+
+  allocator_probe_v15:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v15 (idle-timer-disabled, public-logging, 30-uvec4 shader)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o AllocatorProbe_v15 campaigns/s159_apple/heap_fengshui_v15.m \
+            -isysroot "$SDK" \
+            -framework UIKit -framework WebKit -framework Foundation
+          file AllocatorProbe_v15
+          ls -la AllocatorProbe_v15
+          echo "Build hash: $(shasum -a 256 AllocatorProbe_v15 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v15
+          path: AllocatorProbe_v15
+
+  package_fengshui_v15:
+    runs-on: macos-latest
+    needs: allocator_probe_v15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: allocator-probe-v15
+      - name: Package AllocatorProbe v15 as IPA (idle-timer-disabled + 30-uvec4 shader)
+        run: |
+          mkdir -p AllocatorProbe_v15.app
+          cp AllocatorProbe_v15 AllocatorProbe_v15.app/AllocatorProbe_v15
+          chmod +x AllocatorProbe_v15.app/AllocatorProbe_v15
+          cp campaigns/s159_apple/agxfire_v15.html AllocatorProbe_v15.app/agxfire_v15.html
+
+          cat > AllocatorProbe_v15.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>AllocatorProbe_v15</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.fengshui3</string>
+            <key>CFBundleVersion</key><string>15.0</string>
+            <key>CFBundleShortVersionString</key><string>15.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v15</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - AllocatorProbe_v15.app/AllocatorProbe_v15
+          echo "adhoc codesign: $?"
+          codesign -dv AllocatorProbe_v15.app/AllocatorProbe_v15 2>&1 | head -3
+
+          mkdir -p Payload
+          cp -r AllocatorProbe_v15.app Payload/
+          zip -r AllocatorProbe_v15_sideloadly.ipa Payload/
+          ls -la AllocatorProbe_v15_sideloadly.ipa
+          echo "IPA ready — Sideloadly re-signs with team TMAQ26273N"
+          echo "Bundle after re-sign: com.nexus.fengshui3.TMAQ26273N.TMAQ26273N"
+          echo "Fix: idleTimerDisabled=YES prevents 8BADF00D watchdog kill"
+          echo "Shader: agxfire_v15.html 30-uvec4 precision-fixed"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v15-ipa
+          path: AllocatorProbe_v15_sideloadly.ipa
+
+  allocator_probe_v16:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v16 (pure spray+scan, no WKWebView)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o AllocatorProbe_v16 campaigns/s159_apple/heap_fengshui_v16.m \
+            -isysroot "$SDK" \
+            -framework UIKit -framework Foundation
+          file AllocatorProbe_v16
+          ls -la AllocatorProbe_v16
+          echo "Build hash: $(shasum -a 256 AllocatorProbe_v16 | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v16
+          path: AllocatorProbe_v16
+
+  package_fengshui_v16:
+    runs-on: macos-latest
+    needs: allocator_probe_v16
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: allocator-probe-v16
+      - name: Package AllocatorProbe v16 as signed IPA (pure scan, no GPU crash)
+        run: |
+          mkdir -p AllocatorProbe_v16.app
+          cp AllocatorProbe_v16 AllocatorProbe_v16.app/AllocatorProbe_v16
+          chmod +x AllocatorProbe_v16.app/AllocatorProbe_v16
+
+          cat > AllocatorProbe_v16.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>AllocatorProbe_v16</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.fengshui3</string>
+            <key>CFBundleVersion</key><string>16.0</string>
+            <key>CFBundleShortVersionString</key><string>16.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v16</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - AllocatorProbe_v16.app/AllocatorProbe_v16
+          echo "adhoc codesign: $?"
+
+          mkdir -p Payload
+          cp -r AllocatorProbe_v16.app Payload/
+          zip -r AllocatorProbe_v16_sideloadly.ipa Payload/
+          ls -la AllocatorProbe_v16_sideloadly.ipa
+          echo "IPA ready — Sideloadly re-signs with team TMAQ26273N"
+          echo "Bundle after re-sign: com.nexus.fengshui3.TMAQ26273N.TMAQ26273N"
+          echo "v16: pure scan only, Safari handles AGX overflow, no GPU hang"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v16-ipa
+          path: AllocatorProbe_v16_sideloadly.ipa
