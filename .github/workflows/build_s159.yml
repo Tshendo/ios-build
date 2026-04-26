@@ -567,13 +567,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build AllocatorProbe v16 (pure spray+scan, no WKWebView)
+      - name: Build AllocatorProbe v16 (HTTP reporting via WKWebView, broad kobject scan)
         run: |
           SDK=$(xcrun -sdk iphoneos --show-sdk-path)
           xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
             -o AllocatorProbe_v16 campaigns/s159_apple/heap_fengshui_v16.m \
             -isysroot "$SDK" \
-            -framework UIKit -framework Foundation
+            -framework UIKit -framework WebKit -framework Foundation
           file AllocatorProbe_v16
           ls -la AllocatorProbe_v16
           echo "Build hash: $(shasum -a 256 AllocatorProbe_v16 | cut -d' ' -f1)"
