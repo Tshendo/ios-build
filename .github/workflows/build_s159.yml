@@ -567,7 +567,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build AllocatorProbe v16 (HTTP reporting via WKWebView, broad kobject scan)
+      - name: Build AllocatorProbe v16 (N=20000 + blind-destroy-300s + HTTP reporting + broad scan)
         run: |
           SDK=$(xcrun -sdk iphoneos --show-sdk-path)
           xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
@@ -628,3 +628,69 @@ jobs:
         with:
           name: allocator-probe-v16-ipa
           path: AllocatorProbe_v16_sideloadly.ipa
+
+  allocator_probe_v17_probe:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v17_probe (task_info active probe, no blind-destroy)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o AllocatorProbe_v17probe campaigns/s159_apple/heap_fengshui_v17_probe.m \
+            -isysroot "$SDK" \
+            -framework UIKit -framework WebKit -framework Foundation
+          file AllocatorProbe_v17probe
+          ls -la AllocatorProbe_v17probe
+          echo "Build hash: $(shasum -a 256 AllocatorProbe_v17probe | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v17probe
+          path: AllocatorProbe_v17probe
+
+  package_fengshui_v17_probe:
+    runs-on: macos-latest
+    needs: allocator_probe_v17_probe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: allocator-probe-v17probe
+      - name: Package AllocatorProbe v17_probe as ad-hoc IPA (task_info probe loop)
+        run: |
+          mkdir -p App.app
+          cp AllocatorProbe_v17probe App.app/App
+          chmod +x App.app/App
+
+          cat > App.app/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>App</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.fengshui3</string>
+            <key>CFBundleVersion</key><string>17.0</string>
+            <key>CFBundleShortVersionString</key><string>17.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v17probe</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - App.app/App
+          echo "adhoc codesign: $?"
+
+          mkdir -p Payload
+          cp -r App.app Payload/
+          zip -r AllocatorProbe_v17probe_adhoc.ipa Payload/
+          ls -la AllocatorProbe_v17probe_adhoc.ipa
+          echo "IPA ready — re-sign with data/sign_v17_probe.py (uses v16_signed as template)"
+          echo "Bundle: com.nexus.fengshui3 — installs over v16 on device"
+          echo "v17_probe: task_info probe loop, no blind-destroy, P(qualifying/cycle)=0.037"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allocator-probe-v17probe-ipa
+          path: AllocatorProbe_v17probe_adhoc.ipa
