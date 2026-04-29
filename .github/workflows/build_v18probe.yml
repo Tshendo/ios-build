@@ -1,0 +1,65 @@
+name: v18probe TIMER kotype=27 EL1 write path
+on: [push]
+
+jobs:
+  allocator_probe_v18probe:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AllocatorProbe v18_probe (TIMER kotype=27 mod_refs EL1 write fault path)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc             -o App campaigns/s159_apple/allocator_layout_probe_v18_probe.m             -isysroot "$SDK"             -framework UIKit -framework WebKit -framework Foundation
+          file App
+          ls -la App
+          echo "Build hash: $(shasum -a 256 App | cut -d" " -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-binary
+          path: App
+
+  package_v18probe:
+    runs-on: macos-latest
+    needs: allocator_probe_v18probe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: game-binary
+      - name: Package v18_probe as adhoc IPA
+        run: |
+          mkdir -p App.app
+          cp App App.app/App
+          chmod +x App.app/App
+
+          cat > App.app/Info.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>App</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.layout_manipulation3</string>
+            <key>CFBundleVersion</key><string>18.0</string>
+            <key>CFBundleShortVersionString</key><string>18.0</string>
+            <key>CFBundleName</key><string>AllocatorProbe_v18probe</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - App.app/App
+          echo "adhoc codesign: $?"
+
+          mkdir -p Payload
+          cp -r App.app Payload/
+          zip -r AllocatorProbe_v18probe_adhoc.ipa Payload/
+          ls -la AllocatorProbe_v18probe_adhoc.ipa
+          echo "IPA ready - re-sign with data/sign_v18_probe.py"
+          echo "Bundle: com.nexus.layout_manipulation3 - replaces v17 on device"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-ipa
+          path: AllocatorProbe_v18probe_adhoc.ipa
