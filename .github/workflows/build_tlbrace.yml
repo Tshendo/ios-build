@@ -10,12 +10,11 @@ jobs:
         run: |
           SDK=$(xcrun -sdk iphoneos --show-sdk-path)
 
-          # Compile Metal shader to .metallib, then to embedded C header via xxd
-          xcrun -sdk iphoneos metal campaigns/s156_apple/fill.metal -o fill.air
-          xcrun -sdk iphoneos metallib fill.air -o fill.metallib
+          # Compile Metal shader to .metallib then to C header
+          xcrun -sdk iphoneos metal campaigns/s156_apple/fill.metal -o fill.metallib
           echo "fill.metallib: $(wc -c < fill.metallib) bytes"
-          xxd -i fill.metallib | sed 's/unsigned char fill_metallib\b/static const unsigned char fill_metallib_data/;s/unsigned int fill_metallib_len/static const unsigned int fill_metallib_len/' > campaigns/s156_apple/fill_metallib.h
-          head -2 campaigns/s156_apple/fill_metallib.h
+          xxd -i fill.metallib | sed 's/unsigned char fill_metallib\[/static const unsigned char fill_metallib_data[/;s/unsigned int fill_metallib_len/static const unsigned int fill_metallib_len/' > campaigns/s156_apple/fill_metallib.h
+          head -2 campaigns/s156_apple/fill_metallib.h || true
 
           xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
             -o TLBRace campaigns/s156_apple/metal_tlb_race.m \
