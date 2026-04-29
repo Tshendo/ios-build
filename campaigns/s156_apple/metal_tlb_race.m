@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <os/log.h>
+#include "fill_metallib.h"
 #define LOG(fmt, ...) do { \
     os_log(OS_LOG_DEFAULT, "[TLBR] " fmt, ##__VA_ARGS__); \
     fprintf(stderr, "[TLBR] " fmt "\n", ##__VA_ARGS__); \
@@ -108,20 +109,17 @@ int main(int argc, char *argv[]) {
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
-        /* Compute shader writes GPU_MARKER into IOSurface-backed texture.
-         * BGRA8Unorm texture maps to float [0,1] in Metal shaders (not uchar).
-         * 0x42/0xFF ≈ 0.259, close enough; pipe check uses unsigned byte comparison. */
-        NSString *src = @"#include <metal_stdlib>\n"
-            "using namespace metal;\n"
-            "kernel void fill(texture2d<float, access::write> tex [[texture(0)]],\n"
-            "                 uint2 pos [[thread_position_in_grid]]) {\n"
-            "    tex.write(float4(0.259f, 0.259f, 0.259f, 0.259f), pos);\n"
-            "}\n";
-
+        /* Load pre-compiled fill.metallib embedded in binary.
+         * Writes float4(0.259,...) to BGRA8Unorm IOSurface-backed texture.
+         * 0x259*255 ≈ 0x42 — matches GPU_MARKER byte check in pipe scan. */
         NSError *err = nil;
-        id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
+        dispatch_data_t metal_data = dispatch_data_create(
+            fill_metallib_data, fill_metallib_len,
+            NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        id<MTLLibrary> lib = [device newLibraryWithData:metal_data error:&err];
         if (!lib) {
-            LOG("Shader compile failed: %{public}s", [[err description] UTF8String]);
+            LOG("Library load failed: %{public}ld %{public}s",
+                (long)[err code], [[err localizedDescription] UTF8String]);
             return 1;
         }
 

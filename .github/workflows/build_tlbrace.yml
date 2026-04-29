@@ -9,6 +9,22 @@ jobs:
       - name: Build MetalTLBRace iOS app
         run: |
           SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+
+          # Compile Metal shader to .metallib, then to embedded C header
+          xcrun -sdk iphoneos metal -arch air64 campaigns/s156_apple/fill.metal -o fill.air
+          xcrun -sdk iphoneos metallib fill.air -o fill.metallib
+          python3 -c "
+data = open('fill.metallib','rb').read()
+lines = ['static const unsigned char fill_metallib_data[] = {']
+for i in range(0, len(data), 12):
+    chunk = data[i:i+12]
+    lines.append('    ' + ','.join(str(b) for b in chunk) + ',')
+lines.append('};')
+lines.append(f'static const unsigned int fill_metallib_len = {len(data)};')
+print('\n'.join(lines))
+" > campaigns/s156_apple/fill_metallib.h
+          echo "fill.metallib: $(wc -c < fill.metallib) bytes"
+
           xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
             -o TLBRace campaigns/s156_apple/metal_tlb_race.m \
             -isysroot "$SDK" \
