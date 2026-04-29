@@ -1,0 +1,67 @@
+name: gpu-tlb-race-app
+on: [push]
+
+jobs:
+  build_tlbrace:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build MetalTLBRace iOS app
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o TLBRace campaigns/s156_apple/metal_tlb_race.m \
+            -isysroot "$SDK" \
+            -framework Foundation -framework Metal -framework IOSurface \
+            -framework CoreFoundation
+          file TLBRace
+          ls -la TLBRace
+          echo "Build hash: $(shasum -a 256 TLBRace | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: race-binary
+          path: TLBRace
+
+  package_tlbrace:
+    runs-on: macos-latest
+    needs: build_tlbrace
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: race-binary
+      - name: Package MetalTLBRace as adhoc IPA
+        run: |
+          mkdir -p App.app
+          cp TLBRace App.app/TLBRace
+          chmod +x App.app/TLBRace
+
+          cat > App.app/Info.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>TLBRace</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.layout_manipulation3</string>
+            <key>CFBundleVersion</key><string>1.0</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleName</key><string>RacingGame</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - App.app/TLBRace
+          echo "adhoc codesign: $?"
+
+          mkdir -p Payload
+          cp -r App.app Payload/
+          zip -r MetalTLBRace_adhoc.ipa Payload/
+          ls -la MetalTLBRace_adhoc.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: race-ipa
+          path: MetalTLBRace_adhoc.ipa

