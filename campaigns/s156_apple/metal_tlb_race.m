@@ -104,23 +104,24 @@ int main(int argc, char *argv[]) {
             LOG("No Metal device");
             return 1;
         }
-        LOG("GPU: %s", [[device name] UTF8String]);
+        LOG("GPU: %{public}s", [[device name] UTF8String]);
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
         /* Compute shader writes GPU_MARKER into IOSurface-backed texture.
-         * The texture's physical pages are what we're racing against. */
+         * BGRA8Unorm texture maps to float [0,1] in Metal shaders (not uchar).
+         * 0x42/0xFF ≈ 0.259, close enough; pipe check uses unsigned byte comparison. */
         NSString *src = @"#include <metal_stdlib>\n"
             "using namespace metal;\n"
-            "kernel void fill(texture2d<uchar, access::write> tex [[texture(0)]],\n"
+            "kernel void fill(texture2d<float, access::write> tex [[texture(0)]],\n"
             "                 uint2 pos [[thread_position_in_grid]]) {\n"
-            "    tex.write(uchar4(0x42, 0x42, 0x42, 0x42), pos);\n"
+            "    tex.write(float4(0.259f, 0.259f, 0.259f, 0.259f), pos);\n"
             "}\n";
 
         NSError *err = nil;
         id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
         if (!lib) {
-            LOG("Shader compile failed: %s", [[err description] UTF8String]);
+            LOG("Shader compile failed: %{public}s", [[err description] UTF8String]);
             return 1;
         }
 
