@@ -25,8 +25,8 @@
 #define SURFACE_H       256
 #define BPP             4
 #define SURFACE_SIZE    (SURFACE_W * SURFACE_H * BPP)  /* 256KB */
-#define NUM_RACES       500
-#define NUM_PIPES       5000
+#define NUM_RACES       20
+#define NUM_PIPES       200
 #define PIPE_SIZE       16384   /* 16KB page-aligned */
 #define GPU_MARKER      0x42   /* What GPU shader writes */
 #define PIPE_MARKER     0xAA   /* What we write to pipes */
