@@ -9,7 +9,7 @@ jobs:
       - name: Build AllocatorProbe v18_probe (TIMER kotype=27 mod_refs EL1 write fault path)
         run: |
           SDK=$(xcrun -sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc             -o App campaigns/s159_apple/allocator_layout_probe_v18_probe.m             -isysroot "$SDK"             -framework UIKit -framework WebKit -framework Foundation
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc             -o App campaigns/s159_apple/allocator_layout_probe_v18_probe.m             -isysroot "$SDK"             -framework UIKit -framework WebKit -framework Foundation -framework CoreGraphics
           file App
           ls -la App
           echo "Build hash: $(shasum -a 256 App | cut -d" " -f1)"
