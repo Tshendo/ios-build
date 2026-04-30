@@ -373,10 +373,16 @@ void run_cve28882_poc(UIWindow *window) {
 @property (strong, nonatomic) UIWindow *window;
 @end
 
+@interface RootVC : UIViewController
+@end
+@implementation RootVC
+@end
+
 @implementation AppDelegate
 - (BOOL)application:(UIApplication *)application
     didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     self.window = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
+    self.window.rootViewController = [[RootVC alloc] init];
     self.window.backgroundColor = [UIColor blackColor];
     [self.window makeKeyAndVisible];
     run_cve28882_poc(self.window);
