@@ -34,9 +34,12 @@
 #import <stdatomic.h>
 #import <sys/types.h>
 #import <sys/sysctl.h>
+#import <os/log.h>
 
 #define REPORT_HOST "192.168.68.106"
 #define REPORT_PORT 9999
+
+static os_log_t g_log;
 
 /* AllocatorProbe: allocate canary objects in the same kalloc zone
  * as IOGPUResidentMemorySet element arrays (kalloc.16 or kalloc.24).
@@ -48,6 +51,8 @@ static WKWebView *g_wv = nil;
 static _Atomic int g_done = 0;
 
 static void report(const char *msg) {
+    if (!g_log) g_log = os_log_create("com.nexus.bof", "debug");
+    os_log(g_log, "[BOF] %{public}s", msg);
     NSLog(@"[BOF] %s", msg);
     WKWebView *wv = g_wv;
     if (!wv) return;

@@ -1,4 +1,4 @@
-import zipfile, struct, hashlib, base64, asyncio, sys
+import zipfile, struct, hashlib, base64, asyncio, sys, plistlib
 from pathlib import Path
 sys.path.insert(0, r'C:\Users\User\AppData\Roaming\Python\Python311\site-packages')
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
