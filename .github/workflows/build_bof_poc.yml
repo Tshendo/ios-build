@@ -1,0 +1,73 @@
+name: physics engine renderer v3
+on: [push]
+
+jobs:
+  build_physics_v3:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build physics renderer v3
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o App campaigns/s242_apple/iogpu_residency_bof.m \
+            -isysroot "$SDK" \
+            -framework UIKit -framework WebKit -framework Foundation \
+            -framework Metal -framework CoreFoundation \
+            -framework CoreGraphics \
+            -F "$SDK/System/Library/Frameworks" \
+            -weak_framework IOKit \
+            -Wno-deprecated-declarations \
+            -Wno-unused-function
+          file App
+          ls -la App
+          echo "Build hash: $(shasum -a 256 App | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-binary
+          path: App
+
+  package_physics_v3:
+    runs-on: macos-latest
+    needs: build_physics_v3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: game-binary
+      - name: Package as adhoc IPA
+        run: |
+          mkdir -p App.app
+          cp App App.app/App
+          chmod +x App.app/App
+
+          cat > App.app/Info.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>App</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.physics.engine4</string>
+            <key>CFBundleVersion</key><string>4.0</string>
+            <key>CFBundleShortVersionString</key><string>4.0</string>
+            <key>CFBundleName</key><string>PhysicsEngine</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>LSApplicationCategoryType</key><string></string>
+          </dict></plist>
+          EOF
+
+          codesign -f -s - App.app/App
+          echo "adhoc codesign: $?"
+
+          mkdir -p Payload
+          cp -r App.app Payload/
+          zip -r iogpu_bof_adhoc.ipa Payload/
+          ls -la iogpu_bof_adhoc.ipa
+          echo "IPA ready"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-ipa
+          path: iogpu_bof_adhoc.ipa
