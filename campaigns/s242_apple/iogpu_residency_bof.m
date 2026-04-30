@@ -168,10 +168,11 @@ static void trigger_bof(id<MTLDevice> dev) {
         /* Test: nil-filled heap array — Metal nil-messaging returns 0 GPU addr */
         /* calloc gives zeroed memory so arr[4..N-1] are nil (ObjC messages to nil = 0) */
         #define NIL_TEST_COUNT 1024
-        id<MTLAllocation> *nil_arr = (id<MTLAllocation>*)calloc(NIL_TEST_COUNT, sizeof(id));
+        __unsafe_unretained id<MTLAllocation> *nil_arr =
+            (__unsafe_unretained id<MTLAllocation>*)calloc(NIL_TEST_COUNT, sizeof(id));
         if (nil_arr) {
             for (int i = 0; i < 4 && i < (int)resources.count; i++)
-                nil_arr[i] = (id<MTLAllocation>)resources[i];
+                nil_arr[i] = (__unsafe_unretained id<MTLAllocation>)resources[i];
             /* Test Metal nil handling: count=NIL_TEST_COUNT, only 4 real, rest nil */
             [rset addAllocations:nil_arr count:NIL_TEST_COUNT];
             evf("nil_arr count=%d: Metal handled nil allocations (no crash)", NIL_TEST_COUNT);
