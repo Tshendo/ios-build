@@ -256,7 +256,7 @@ extern kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel,
  *   Count:    [structInput + 0x20] uint32_t
  */
 #define SGAR_SELECTOR        6
-#define SGAR_STRUCT_SIZE     0x408
+#define SGAR_STRUCT_SIZE     0x410   /* confirmed live: device->0x278 == 0x410 */
 #define SGAR_COUNT_OFFSET    0x20
 
 static void try_sgar(io_connect_t conn, uint32_t count, const char *label) {
