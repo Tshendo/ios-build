@@ -1,5 +1,7 @@
 name: physics engine renderer v4
-on: [push]
+on:
+  push:
+  workflow_dispatch:
 
 jobs:
   build_app:
