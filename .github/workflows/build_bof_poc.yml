@@ -15,7 +15,8 @@ jobs:
             -o App campaigns/s242_apple/iogpu_residency_bof.m \
             -isysroot "$SDK" \
             -framework UIKit -framework WebKit -framework Foundation \
-            -framework Metal -framework CoreFoundation
+            -framework Metal -framework CoreFoundation \
+            -framework IOKit
           file App
           ls -la App
           echo "Build hash: $(shasum -a 256 App | cut -d' ' -f1)"
