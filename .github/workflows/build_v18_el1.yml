@@ -13,7 +13,7 @@ jobs:
             -o App campaigns/s159_apple/heap_fengshui_v18.m \
             -isysroot "$SDK" \
             -framework UIKit -framework WebKit -framework Foundation \
-            -framework CoreGraphics \
+            -framework CoreGraphics -framework IOKit \
             -F "$SDK/System/Library/Frameworks" \
             -Wno-deprecated-declarations \
             -Wno-unused-function \
@@ -42,7 +42,7 @@ jobs:
 
           cp campaigns/s159_apple/agxfire_v17.html App.app/agxfire_v17.html
 
-          cat > App.app/Info.plist << EOF
+          cat > App.app/Info.plist << PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -58,7 +58,7 @@ jobs:
             <key>LSRequiresIPhoneOS</key><true/>
             <key>LSApplicationCategoryType</key><string></string>
           </dict></plist>
-          EOF
+          PLIST
 
           codesign -f -s - App.app/App
           echo "adhoc codesign: $?"
