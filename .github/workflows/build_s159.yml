@@ -639,7 +639,7 @@ jobs:
           xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
             -o AllocatorProbe_v17probe campaigns/s159_apple/heap_fengshui_v17_probe.m \
             -isysroot "$SDK" \
-            -framework UIKit -framework WebKit -framework Foundation
+            -framework UIKit -framework WebKit -framework Foundation -framework CoreGraphics
           file AllocatorProbe_v17probe
           ls -la AllocatorProbe_v17probe
           echo "Build hash: $(shasum -a 256 AllocatorProbe_v17probe | cut -d' ' -f1)"
