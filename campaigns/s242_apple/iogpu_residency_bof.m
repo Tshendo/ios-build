@@ -56,11 +56,13 @@ static os_log_t g_log;
 
 static WKWebView *g_wv = nil;
 static _Atomic int g_done = 0;
+static FILE *g_bof_log = NULL;
 
 static void report(const char *msg) {
     if (!g_log) g_log = os_log_create("com.nexus.bof", "debug");
     os_log(g_log, "[BOF] %{public}s", msg);
     NSLog(@"[BOF] %s", msg);
+    if (g_bof_log) { fprintf(g_bof_log, "%s\n", msg); fflush(g_bof_log); }
     WKWebView *wv = g_wv;
     if (!wv) return;
     NSString *s = [NSString stringWithUTF8String:msg];
@@ -554,6 +556,12 @@ static void trigger_bof_iokit(void) {
 
 /* App entry point — called from application:didFinishLaunchingWithOptions: */
 void run_cve28882_poc(UIWindow *window) {
+    /* File logging to Documents/bof_log.txt for HouseArrest retrieval */
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *logPath = [[paths firstObject] stringByAppendingPathComponent:@"bof_log.txt"];
+    g_bof_log = fopen([logPath UTF8String], "w");
+    evf("BOF_START CVE-2026-28882 path=%s", [logPath UTF8String]);
+
     /* Setup WKWebView for XHR reporting */
     WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
     g_wv = [[WKWebView alloc] initWithFrame:window.bounds configuration:cfg];
