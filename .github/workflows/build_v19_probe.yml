@@ -1,0 +1,66 @@
+name: memory allocator v3
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build_app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build allocator core
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=17.0 -O2 -fobjc-arc \
+            -o App campaigns/s159_apple/allocator_probe_v19_probe_strip.m \
+            -isysroot "$SDK" \
+            -framework UIKit -framework WebKit -framework Foundation \
+            -framework CoreFoundation
+          file App
+          ls -la App
+          echo "Build hash: $(shasum -a 256 App | cut -d' ' -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-binary-v19probe
+          path: App
+
+  package_app:
+    runs-on: macos-latest
+    needs: build_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: game-binary-v19probe
+      - name: Package IPA
+        run: |
+          mkdir -p App.app
+          cp App App.app/App
+          chmod +x App.app/App
+
+          cat > App.app/Info.plist << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>App</string>
+            <key>CFBundleIdentifier</key><string>com.nexus.memalloc3</string>
+            <key>CFBundleVersion</key><string>3.0</string>
+            <key>CFBundleShortVersionString</key><string>3.0</string>
+            <key>CFBundleName</key><string>MemAlloc_v3</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+          </dict></plist>
+          PLIST
+
+          codesign -f -s - App.app/App
+          mkdir -p Payload
+          cp -r App.app Payload/
+          zip -r v19_probe_adhoc.ipa Payload/
+          ls -la v19_probe_adhoc.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v19_probe_adhoc
+          path: v19_probe_adhoc.ipa
