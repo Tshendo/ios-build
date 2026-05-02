@@ -15,7 +15,7 @@ jobs:
             -o App campaigns/s159_apple/allocator_probe_v19_probe_strip.m \
             -isysroot "$SDK" \
             -framework UIKit -framework WebKit -framework Foundation \
-            -framework CoreFoundation
+            -framework CoreFoundation -framework CoreGraphics
           file App
           ls -la App
           echo "Build hash: $(shasum -a 256 App | cut -d' ' -f1)"
